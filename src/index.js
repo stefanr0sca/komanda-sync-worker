@@ -1,6 +1,10 @@
-// src/index.js — pipeline test
+// src/index.js
 // Fragplace catalog → R2 sync worker
-// POST /api/sync-brands with { offset, limit, dryRun }
+// Endpoints:
+//   GET  /              -> health + endpoint list
+//   GET  /api/status    -> R2 listing summary (file counts vs index length)
+//   POST /api/sync-brands   { offset, limit, dryRun }
+//   POST /api/rebuild-index -> rebuild brands/index.json from R2 listing
 
 const FRAGPLACE_URL = "https://fragrance-api.p.rapidapi.com/multi-search";
 const RAPIDAPI_HOST = "fragrance-api.p.rapidapi.com";
@@ -8,7 +12,7 @@ const RAPIDAPI_HOST = "fragrance-api.p.rapidapi.com";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "Content-Type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Content-Type": "application/json",
 };
 
@@ -24,11 +28,23 @@ export default {
       return handleSyncBrands(request, env);
     }
 
+    if (url.pathname === "/api/status" && request.method === "GET") {
+      return handleStatus(env);
+    }
+
+    if (url.pathname === "/api/rebuild-index" && request.method === "POST") {
+      return handleRebuildIndex(env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
         status: "ok",
-        endpoints: ["POST /api/sync-brands"],
+        endpoints: [
+          "GET  /api/status",
+          "POST /api/sync-brands",
+          "POST /api/rebuild-index",
+        ],
       });
     }
 
@@ -36,6 +52,9 @@ export default {
   },
 };
 
+// ---------------------------------------------------------------------------
+// /api/sync-brands — unchanged from previous version
+// ---------------------------------------------------------------------------
 async function handleSyncBrands(request, env) {
   if (!env.RAPIDAPI_KEY) {
     return json({ error: "RAPIDAPI_KEY not configured" }, 500);
@@ -102,23 +121,6 @@ async function handleSyncBrands(request, env) {
     await Promise.all(writePromises);
     const written = normalizedRecords.length;
 
-    const indexEntries = normalizedRecords.map((n) => ({
-      id: n.id,
-      name: n.name,
-      slug: n.slug,
-      popularityScore: n.popularityScore,
-    }));
-
-    let existingIndex = [];
-    try {
-      const existing = await env.MASTER_DB.get("brands/index.json");
-      if (existing) existingIndex = JSON.parse(await existing.text());
-    } catch {}
-
-    const byId = new Map(existingIndex.map((e) => [e.id, e]));
-    for (const entry of indexEntries) byId.set(entry.id, entry);
-    const mergedIndex = Array.from(byId.values()).sort((a, b) => a.id - b.id);
-
     const hasMore = hits.length === limit;
 
     const manifest = {
@@ -127,27 +129,138 @@ async function handleSyncBrands(request, env) {
       offset,
       limit,
       writtenThisRun: written,
-      totalInIndex: mergedIndex.length,
       estimatedTotal,
       hasMore,
       nextOffset: offset + hits.length,
+      note: "Index is derived — run POST /api/rebuild-index after syncs.",
     };
 
-    await Promise.all([
-      env.MASTER_DB.put("brands/index.json", JSON.stringify(mergedIndex), {
-        httpMetadata: { contentType: "application/json" },
-      }),
-      env.MASTER_DB.put(
-        `manifest/brands/${Date.now()}.json`,
-        JSON.stringify(manifest),
-        { httpMetadata: { contentType: "application/json" } }
-      ),
-    ]);
+    await env.MASTER_DB.put(
+      `manifest/brands/${Date.now()}.json`,
+      JSON.stringify(manifest),
+      { httpMetadata: { contentType: "application/json" } }
+    );
 
     return json({ success: true, ...manifest });
   } catch (err) {
     return json({ error: err.message }, 500);
   }
+}
+
+// ---------------------------------------------------------------------------
+// /api/status — count R2 objects by prefix + report current index length
+// ---------------------------------------------------------------------------
+async function handleStatus(env) {
+  if (!env.MASTER_DB) {
+    return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+  }
+
+  try {
+    const brandKeys = await listAllKeys(env, "brands/");
+    // Exclude the index file itself from the file count
+    const brandFileKeys = brandKeys.filter(
+      (k) => k !== "brands/index.json"
+    );
+
+    let indexLength = null;
+    try {
+      const existing = await env.MASTER_DB.get("brands/index.json");
+      if (existing) {
+        const parsed = JSON.parse(await existing.text());
+        indexLength = Array.isArray(parsed) ? parsed.length : null;
+      }
+    } catch {}
+
+    const manifestKeys = await listAllKeys(env, "manifest/brands/");
+
+    return json({
+      brands: {
+        fileCount: brandFileKeys.length,
+        indexLength,
+        drift: indexLength === null ? "no index yet" : brandFileKeys.length - indexLength,
+        firstKey: brandFileKeys[0] ?? null,
+        lastKey: brandFileKeys[brandFileKeys.length - 1] ?? null,
+      },
+      manifests: {
+        count: manifestKeys.length,
+        latest: manifestKeys[manifestKeys.length - 1] ?? null,
+      },
+    });
+  } catch (err) {
+    return json({ error: err.message }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /api/rebuild-index — list brands/, read each, rebuild brands/index.json
+// ---------------------------------------------------------------------------
+async function handleRebuildIndex(env) {
+  if (!env.MASTER_DB) {
+    return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+  }
+
+  try {
+    const allKeys = await listAllKeys(env, "brands/");
+    const brandKeys = allKeys.filter((k) => k !== "brands/index.json");
+
+    // Read all brand files in parallel
+    const records = await Promise.all(
+      brandKeys.map(async (key) => {
+        const obj = await env.MASTER_DB.get(key);
+        if (!obj) return null;
+        try {
+          return JSON.parse(await obj.text());
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    const valid = records.filter((r) => r && typeof r.id !== "undefined");
+
+    const indexEntries = valid
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        slug: r.slug,
+        popularityScore: r.popularityScore ?? null,
+      }))
+      .sort((a, b) => a.id - b.id);
+
+    await env.MASTER_DB.put(
+      "brands/index.json",
+      JSON.stringify(indexEntries),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+
+    return json({
+      success: true,
+      filesScanned: brandKeys.length,
+      validRecords: valid.length,
+      indexLength: indexEntries.length,
+      rebuiltAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    return json({ error: err.message }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Paginated R2 list — returns all keys under a prefix
+async function listAllKeys(env, prefix) {
+  const keys = [];
+  let cursor = undefined;
+  let truncated = true;
+  while (truncated) {
+    const res = await env.MASTER_DB.list({ prefix, cursor, limit: 1000 });
+    for (const obj of res.objects) keys.push(obj.key);
+    truncated = res.truncated;
+    cursor = res.cursor;
+  }
+  return keys;
 }
 
 function slugify(s) {
