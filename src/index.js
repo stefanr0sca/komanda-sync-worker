@@ -4,10 +4,14 @@
 //   GET  /              -> health + endpoint list
 //   GET  /api/status    -> R2 listing summary (file counts vs index length)
 //   POST /api/sync-brands   { offset, limit, dryRun }
-//   POST /api/rebuild-index -> rebuild brands/index.json from R2 listing
+//   POST /api/rebuild-index -> rebuild brands/index.json from R2 listing (chunked)
 
 const FRAGPLACE_URL = "https://fragrance-api.p.rapidapi.com/multi-search";
 const RAPIDAPI_HOST = "fragrance-api.p.rapidapi.com";
+
+// Keep each parallel batch well under Cloudflare's 1000-subrequest-per-invocation
+// limit. 400 leaves headroom for the list() call and the final put().
+const REBUILD_CHUNK_SIZE = 400;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -53,7 +57,7 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// /api/sync-brands — unchanged from previous version
+// /api/sync-brands
 // ---------------------------------------------------------------------------
 async function handleSyncBrands(request, env) {
   if (!env.RAPIDAPI_KEY) {
@@ -148,7 +152,7 @@ async function handleSyncBrands(request, env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/status — count R2 objects by prefix + report current index length
+// /api/status
 // ---------------------------------------------------------------------------
 async function handleStatus(env) {
   if (!env.MASTER_DB) {
@@ -157,10 +161,7 @@ async function handleStatus(env) {
 
   try {
     const brandKeys = await listAllKeys(env, "brands/");
-    // Exclude the index file itself from the file count
-    const brandFileKeys = brandKeys.filter(
-      (k) => k !== "brands/index.json"
-    );
+    const brandFileKeys = brandKeys.filter((k) => k !== "brands/index.json");
 
     let indexLength = null;
     try {
@@ -192,7 +193,7 @@ async function handleStatus(env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/rebuild-index — list brands/, read each, rebuild brands/index.json
+// /api/rebuild-index — chunked to stay under the subrequest limit per invocation
 // ---------------------------------------------------------------------------
 async function handleRebuildIndex(env) {
   if (!env.MASTER_DB) {
@@ -203,20 +204,33 @@ async function handleRebuildIndex(env) {
     const allKeys = await listAllKeys(env, "brands/");
     const brandKeys = allKeys.filter((k) => k !== "brands/index.json");
 
-    // Read all brand files in parallel
-    const records = await Promise.all(
-      brandKeys.map(async (key) => {
-        const obj = await env.MASTER_DB.get(key);
-        if (!obj) return null;
-        try {
-          return JSON.parse(await obj.text());
-        } catch {
-          return null;
-        }
-      })
-    );
+    const valid = [];
+    let skipped = 0;
 
-    const valid = records.filter((r) => r && typeof r.id !== "undefined");
+    // Read in sequential chunks — each chunk fires its gets in parallel,
+    // but chunks run one after another so the per-invocation subrequest
+    // tally never spikes past the cap.
+    for (let i = 0; i < brandKeys.length; i += REBUILD_CHUNK_SIZE) {
+      const slice = brandKeys.slice(i, i + REBUILD_CHUNK_SIZE);
+      const records = await Promise.all(
+        slice.map(async (key) => {
+          try {
+            const obj = await env.MASTER_DB.get(key);
+            if (!obj) return null;
+            return JSON.parse(await obj.text());
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const r of records) {
+        if (r && typeof r.id !== "undefined") {
+          valid.push(r);
+        } else {
+          skipped++;
+        }
+      }
+    }
 
     const indexEntries = valid
       .map((r) => ({
@@ -237,6 +251,9 @@ async function handleRebuildIndex(env) {
       success: true,
       filesScanned: brandKeys.length,
       validRecords: valid.length,
+      skipped,
+      chunkSize: REBUILD_CHUNK_SIZE,
+      chunks: Math.ceil(brandKeys.length / REBUILD_CHUNK_SIZE),
       indexLength: indexEntries.length,
       rebuiltAt: new Date().toISOString(),
     });
@@ -249,7 +266,6 @@ async function handleRebuildIndex(env) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Paginated R2 list — returns all keys under a prefix
 async function listAllKeys(env, prefix) {
   const keys = [];
   let cursor = undefined;
