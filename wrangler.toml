@@ -5,3 +5,6 @@ compatibility_date = "2025-01-01"
 [[r2_buckets]]
 binding = "MASTER_DB"
 bucket_name = "komanda-master-db"
+
+[limits]
+subrequests = 10000
