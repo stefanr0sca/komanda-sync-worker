@@ -1,4 +1,4 @@
-// src/index.js
+// src/index.js — pipeline test
 // Fragplace catalog → R2 sync worker
 // POST /api/sync-brands with { offset, limit, dryRun }
 
