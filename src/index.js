@@ -1,16 +1,15 @@
 // src/index.js
 // Fragplace catalog → R2 sync worker
 // Endpoints:
-//   GET  /              -> health + endpoint list
-//   GET  /api/status    -> R2 listing summary (file counts vs index length)
-//   POST /api/sync-brands   { offset, limit, dryRun }
-//   POST /api/rebuild-index -> rebuild brands/index.json from R2 listing (chunked)
+//   GET  /                          -> health + endpoint list
+//   GET  /api/status                -> R2 listing summary + last rebuild state
+//   POST /api/sync-brands           -> fetch & write a brand batch to R2
+//   POST /api/rebuild-index         -> trigger rebuild (fire-and-forget, returns immediately)
+//
+// Also runs automatically every 6 hours via cron trigger (see wrangler.toml).
 
 const FRAGPLACE_URL = "https://fragrance-api.p.rapidapi.com/multi-search";
 const RAPIDAPI_HOST = "fragrance-api.p.rapidapi.com";
-
-// Keep each parallel batch well under Cloudflare's 1000-subrequest-per-invocation
-// limit. 400 leaves headroom for the list() call and the final put().
 const REBUILD_CHUNK_SIZE = 400;
 
 const corsHeaders = {
@@ -21,7 +20,7 @@ const corsHeaders = {
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -37,7 +36,7 @@ export default {
     }
 
     if (url.pathname === "/api/rebuild-index" && request.method === "POST") {
-      return handleRebuildIndex(env);
+      return handleRebuildTrigger(env, ctx);
     }
 
     if (url.pathname === "/" || url.pathname === "/health") {
@@ -47,12 +46,19 @@ export default {
         endpoints: [
           "GET  /api/status",
           "POST /api/sync-brands",
-          "POST /api/rebuild-index",
+          "POST /api/rebuild-index  (fire-and-forget; poll /api/status for progress)",
         ],
+        cron: "Rebuild runs automatically every 6 hours.",
       });
     }
 
     return json({ error: "Not found" }, 404);
+  },
+
+  // Cron trigger — Cloudflare calls this on the schedule defined in wrangler.toml
+  async scheduled(event, env, ctx) {
+    console.log("Cron trigger fired:", event.cron);
+    ctx.waitUntil(rebuildIndexCore(env, "cron"));
   },
 };
 
@@ -60,12 +66,8 @@ export default {
 // /api/sync-brands
 // ---------------------------------------------------------------------------
 async function handleSyncBrands(request, env) {
-  if (!env.RAPIDAPI_KEY) {
-    return json({ error: "RAPIDAPI_KEY not configured" }, 500);
-  }
-  if (!env.MASTER_DB) {
-    return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-  }
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
 
   let body = {};
   try { body = await request.json(); } catch {}
@@ -86,10 +88,7 @@ async function handleSyncBrands(request, env) {
 
     if (!res.ok) {
       const errText = await res.text();
-      return json({
-        error: `Fragplace error ${res.status}`,
-        detail: errText.slice(0, 300),
-      }, res.status);
+      return json({ error: `Fragplace error ${res.status}`, detail: errText.slice(0, 300) }, res.status);
     }
 
     const data = await res.json();
@@ -97,12 +96,7 @@ async function handleSyncBrands(request, env) {
     const estimatedTotal = data?.results?.[0]?.estimatedTotalHits ?? hits.length;
 
     if (dryRun) {
-      return json({
-        dryRun: true,
-        received: hits.length,
-        estimatedTotal,
-        sample: hits.slice(0, 3),
-      });
+      return json({ dryRun: true, received: hits.length, estimatedTotal, sample: hits.slice(0, 3) });
     }
 
     const normalizedRecords = hits.map((b) => ({
@@ -123,20 +117,18 @@ async function handleSyncBrands(request, env) {
       })
     );
     await Promise.all(writePromises);
-    const written = normalizedRecords.length;
 
     const hasMore = hits.length === limit;
-
     const manifest = {
       syncedAt: new Date().toISOString(),
       type: "brands",
       offset,
       limit,
-      writtenThisRun: written,
+      writtenThisRun: normalizedRecords.length,
       estimatedTotal,
       hasMore,
       nextOffset: offset + hits.length,
-      note: "Index is derived — run POST /api/rebuild-index after syncs.",
+      note: "Index is derived — run POST /api/rebuild-index after syncs, or wait for cron.",
     };
 
     await env.MASTER_DB.put(
@@ -152,12 +144,10 @@ async function handleSyncBrands(request, env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/status
+// /api/status — includes the latest rebuild-state record so we can poll progress
 // ---------------------------------------------------------------------------
 async function handleStatus(env) {
-  if (!env.MASTER_DB) {
-    return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-  }
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
 
   try {
     const brandKeys = await listAllKeys(env, "brands/");
@@ -174,6 +164,12 @@ async function handleStatus(env) {
 
     const manifestKeys = await listAllKeys(env, "manifest/brands/");
 
+    let rebuildState = null;
+    try {
+      const stateObj = await env.MASTER_DB.get("state/rebuild.json");
+      if (stateObj) rebuildState = JSON.parse(await stateObj.text());
+    } catch {}
+
     return json({
       brands: {
         fileCount: brandFileKeys.length,
@@ -186,6 +182,7 @@ async function handleStatus(env) {
         count: manifestKeys.length,
         latest: manifestKeys[manifestKeys.length - 1] ?? null,
       },
+      rebuild: rebuildState,
     });
   } catch (err) {
     return json({ error: err.message }, 500);
@@ -193,13 +190,33 @@ async function handleStatus(env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/rebuild-index — chunked to stay under the subrequest limit per invocation
+// /api/rebuild-index — trigger only. Returns instantly; real work runs async.
 // ---------------------------------------------------------------------------
-async function handleRebuildIndex(env) {
-  if (!env.MASTER_DB) {
-    return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-  }
+async function handleRebuildTrigger(env, ctx) {
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
 
+  const startedAt = new Date().toISOString();
+  await env.MASTER_DB.put(
+    "state/rebuild.json",
+    JSON.stringify({ status: "running", startedAt, trigger: "http" }),
+    { httpMetadata: { contentType: "application/json" } }
+  );
+
+  ctx.waitUntil(rebuildIndexCore(env, "http"));
+
+  return json({
+    accepted: true,
+    status: "rebuild started in background",
+    startedAt,
+    pollFor: "GET /api/status -> rebuild.status will flip from 'running' to 'done' (or 'error')",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Core rebuild — called from waitUntil() or cron. Writes progress to state file.
+// ---------------------------------------------------------------------------
+async function rebuildIndexCore(env, trigger) {
+  const startedAt = new Date().toISOString();
   try {
     const allKeys = await listAllKeys(env, "brands/");
     const brandKeys = allKeys.filter((k) => k !== "brands/index.json");
@@ -207,9 +224,6 @@ async function handleRebuildIndex(env) {
     const valid = [];
     let skipped = 0;
 
-    // Read in sequential chunks — each chunk fires its gets in parallel,
-    // but chunks run one after another so the per-invocation subrequest
-    // tally never spikes past the cap.
     for (let i = 0; i < brandKeys.length; i += REBUILD_CHUNK_SIZE) {
       const slice = brandKeys.slice(i, i + REBUILD_CHUNK_SIZE);
       const records = await Promise.all(
@@ -224,11 +238,8 @@ async function handleRebuildIndex(env) {
         })
       );
       for (const r of records) {
-        if (r && typeof r.id !== "undefined") {
-          valid.push(r);
-        } else {
-          skipped++;
-        }
+        if (r && typeof r.id !== "undefined") valid.push(r);
+        else skipped++;
       }
     }
 
@@ -247,18 +258,35 @@ async function handleRebuildIndex(env) {
       { httpMetadata: { contentType: "application/json" } }
     );
 
-    return json({
-      success: true,
-      filesScanned: brandKeys.length,
-      validRecords: valid.length,
-      skipped,
-      chunkSize: REBUILD_CHUNK_SIZE,
-      chunks: Math.ceil(brandKeys.length / REBUILD_CHUNK_SIZE),
-      indexLength: indexEntries.length,
-      rebuiltAt: new Date().toISOString(),
-    });
+    await env.MASTER_DB.put(
+      "state/rebuild.json",
+      JSON.stringify({
+        status: "done",
+        trigger,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        filesScanned: brandKeys.length,
+        validRecords: valid.length,
+        skipped,
+        indexLength: indexEntries.length,
+      }),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+
+    console.log("Rebuild done:", indexEntries.length, "entries");
   } catch (err) {
-    return json({ error: err.message }, 500);
+    console.error("Rebuild failed:", err.message);
+    await env.MASTER_DB.put(
+      "state/rebuild.json",
+      JSON.stringify({
+        status: "error",
+        trigger,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        error: err.message,
+      }),
+      { httpMetadata: { contentType: "application/json" } }
+    );
   }
 }
 
