@@ -9,3 +9,6 @@ bucket_name = "komanda-master-db"
 [limits]
 subrequests = 10000
 cpu_ms = 300000
+
+[triggers]
+crons = ["0 */6 * * *"]
