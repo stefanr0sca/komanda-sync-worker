@@ -42,6 +42,10 @@ export default {
       return handleRebuildChunk(request, env);
     }
 
+    if (url.pathname === "/api/probe-fragplace" && request.method === "POST") {
+      return handleProbeFragplace(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -50,6 +54,7 @@ export default {
           "GET  /api/status",
           "POST /api/sync-brands",
           "POST /api/rebuild-index  (processes one chunk; loop until done: true)",
+          "POST /api/probe-fragplace  (read-only EAN coverage check for a brand)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -307,6 +312,92 @@ async function handleRebuildChunk(request, env) {
         { httpMetadata: { contentType: "application/json" } }
       );
     } catch {}
+    return json({ error: err.message }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /api/probe-fragplace — read-only diagnostic probe of Fragplace products
+// for a given brandId. Reports EAN / barcode / UPC coverage plus full raw
+// sample + all top-level field names seen.
+//
+// POST body: { brandId: number, limit?: number (default 100, max 500) }
+// ---------------------------------------------------------------------------
+async function handleProbeFragplace(request, env) {
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { brandId, limit = 100 } = body;
+
+  if (!brandId) {
+    return json({ error: "brandId required in POST body, e.g. { \"brandId\": 123 }" }, 400);
+  }
+
+  try {
+    const res = await fetch(FRAGPLACE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": env.RAPIDAPI_KEY,
+      },
+      body: JSON.stringify({
+        queries: [{
+          indexUid: "products",
+          q: "",
+          filter: `brandId = ${brandId}`,
+          limit,
+          offset: 0,
+        }],
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return json({
+        error: `Fragplace error ${res.status}`,
+        detail: errText.slice(0, 500),
+      }, res.status);
+    }
+
+    const data = await res.json();
+    const hits = data?.results?.[0]?.hits || [];
+    const estimatedTotal = data?.results?.[0]?.estimatedTotalHits ?? hits.length;
+
+    let withEAN = 0;
+    let withBarcode = 0;
+    let withUPC = 0;
+    const eanValues = [];
+    const fieldNamesSeen = new Set();
+
+    for (const h of hits) {
+      for (const k of Object.keys(h)) fieldNamesSeen.add(k);
+      const ean = h.ean || h.EAN || h.Ean;
+      const barcode = h.barcode || h.Barcode;
+      const upc = h.upc || h.UPC || h.Upc;
+      if (ean) { withEAN++; eanValues.push({ id: h.id, name: h.name, ean }); }
+      if (barcode) withBarcode++;
+      if (upc) withUPC++;
+    }
+
+    return json({
+      brandId,
+      sampled: hits.length,
+      estimatedTotalForBrand: estimatedTotal,
+      coverage: {
+        withEAN,
+        withBarcode,
+        withUPC,
+        percentEAN: hits.length ? Math.round((withEAN / hits.length) * 100) : 0,
+        percentBarcode: hits.length ? Math.round((withBarcode / hits.length) * 100) : 0,
+        percentUPC: hits.length ? Math.round((withUPC / hits.length) * 100) : 0,
+      },
+      topLevelFieldsSeen: Array.from(fieldNamesSeen).sort(),
+      firstSampleRaw: hits[0] || null,
+      eanSamples: eanValues.slice(0, 10),
+    });
+  } catch (err) {
     return json({ error: err.message }, 500);
   }
 }
