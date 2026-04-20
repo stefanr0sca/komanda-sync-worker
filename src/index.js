@@ -321,17 +321,22 @@ async function handleRebuildChunk(request, env) {
 // for a given brandId. Reports EAN / barcode / UPC coverage plus full raw
 // sample + all top-level field names seen.
 //
-// POST body: { brandId: number, limit?: number (default 100, max 500) }
+// ---------------------------------------------------------------------------
+// /api/probe-fragplace — read-only diagnostic probe of Fragplace fragrances
+// for a given brand name. Reports EAN / barcode / UPC coverage plus full raw
+// sample + all top-level field names seen.
+//
+// POST body: { brandName: string, limit?: number (default 100, max 500) }
 // ---------------------------------------------------------------------------
 async function handleProbeFragplace(request, env) {
   if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
 
   let body = {};
   try { body = await request.json(); } catch {}
-  const { brandId, limit = 100 } = body;
+  const { brandName, limit = 100 } = body;
 
-  if (!brandId) {
-    return json({ error: "brandId required in POST body, e.g. { \"brandId\": 123 }" }, 400);
+  if (!brandName) {
+    return json({ error: "brandName required in POST body, e.g. { \"brandName\": \"Lattafa\" }" }, 400);
   }
 
   try {
@@ -344,9 +349,9 @@ async function handleProbeFragplace(request, env) {
       },
       body: JSON.stringify({
         queries: [{
-          indexUid: "products",
+          indexUid: "fragrances",
           q: "",
-          filter: `brandId = ${brandId}`,
+          filter: [`brand.name = "${brandName}"`],
           limit,
           offset: 0,
         }],
@@ -382,7 +387,7 @@ async function handleProbeFragplace(request, env) {
     }
 
     return json({
-      brandId,
+      brandName,
       sampled: hits.length,
       estimatedTotalForBrand: estimatedTotal,
       coverage: {
