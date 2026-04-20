@@ -54,7 +54,7 @@ export default {
           "GET  /api/status",
           "POST /api/sync-brands",
           "POST /api/rebuild-index  (processes one chunk; loop until done: true)",
-          "POST /api/probe-fragplace  (read-only EAN coverage check for a brand)",
+          "POST /api/probe-fragplace  (read-only EAN coverage check; brandName optional)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -317,26 +317,33 @@ async function handleRebuildChunk(request, env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/probe-fragplace — read-only diagnostic probe of Fragplace products
-// for a given brandId. Reports EAN / barcode / UPC coverage plus full raw
-// sample + all top-level field names seen.
+// /api/probe-fragplace — read-only diagnostic probe of Fragplace fragrances.
 //
-// ---------------------------------------------------------------------------
-// /api/probe-fragplace — read-only diagnostic probe of Fragplace fragrances
-// for a given brand name. Reports EAN / barcode / UPC coverage plus full raw
-// sample + all top-level field names seen.
+// If brandName is provided, filters by `brand.name = "<brandName>"`.
+// If brandName is omitted/empty, runs UNFILTERED so we can inspect the true
+// product schema (field names, EAN location, brand field shape).
 //
-// POST body: { brandName: string, limit?: number (default 100, max 500) }
+// Reports EAN / barcode / UPC coverage plus full raw first product and all
+// top-level field names seen. Does NOT write to R2.
+//
+// POST body: { brandName?: string, limit?: number (default 100) }
 // ---------------------------------------------------------------------------
 async function handleProbeFragplace(request, env) {
   if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
 
   let body = {};
   try { body = await request.json(); } catch {}
-  const { brandName, limit = 100 } = body;
+  const rawBrandName = typeof body.brandName === "string" ? body.brandName.trim() : "";
+  const limit = body.limit || 100;
 
-  if (!brandName) {
-    return json({ error: "brandName required in POST body, e.g. { \"brandName\": \"Lattafa\" }" }, 400);
+  const query = {
+    indexUid: "fragrances",
+    q: "",
+    limit,
+    offset: 0,
+  };
+  if (rawBrandName) {
+    query.filter = [`brand.name = "${rawBrandName}"`];
   }
 
   try {
@@ -347,15 +354,7 @@ async function handleProbeFragplace(request, env) {
         "x-rapidapi-host": RAPIDAPI_HOST,
         "x-rapidapi-key": env.RAPIDAPI_KEY,
       },
-      body: JSON.stringify({
-        queries: [{
-          indexUid: "fragrances",
-          q: "",
-          filter: [`brand.name = "${brandName}"`],
-          limit,
-          offset: 0,
-        }],
-      }),
+      body: JSON.stringify({ queries: [query] }),
     });
 
     if (!res.ok) {
@@ -363,12 +362,14 @@ async function handleProbeFragplace(request, env) {
       return json({
         error: `Fragplace error ${res.status}`,
         detail: errText.slice(0, 500),
+        queryUsed: query,
       }, res.status);
     }
 
     const data = await res.json();
-    const hits = data?.results?.[0]?.hits || [];
-    const estimatedTotal = data?.results?.[0]?.estimatedTotalHits ?? hits.length;
+    const firstResult = data?.results?.[0] || {};
+    const hits = firstResult.hits || [];
+    const estimatedTotal = firstResult.estimatedTotalHits ?? hits.length;
 
     let withEAN = 0;
     let withBarcode = 0;
@@ -387,7 +388,8 @@ async function handleProbeFragplace(request, env) {
     }
 
     return json({
-      brandName,
+      brandName: rawBrandName || null,
+      filterApplied: Boolean(rawBrandName),
       sampled: hits.length,
       estimatedTotalForBrand: estimatedTotal,
       coverage: {
@@ -401,9 +403,10 @@ async function handleProbeFragplace(request, env) {
       topLevelFieldsSeen: Array.from(fieldNamesSeen).sort(),
       firstSampleRaw: hits[0] || null,
       eanSamples: eanValues.slice(0, 10),
+      queryUsed: query,
     });
   } catch (err) {
-    return json({ error: err.message }, 500);
+    return json({ error: err.message, queryUsed: query }, 500);
   }
 }
 
