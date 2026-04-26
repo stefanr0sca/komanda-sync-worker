@@ -133,7 +133,10 @@ async function handleProbeFragella(request, env) {
       .trim();
   }
 
-  const searchQuery = normalize(scentName);
+  // Include brand name in search query for precision — "Lattafa Yara" beats "Yara" alone
+  const searchQuery = brandName
+    ? normalize(brandName + " " + scentName)
+    : normalize(scentName);
 
   try {
     const url = `${FRAGELLA_BASE}/fragrances?search=${encodeURIComponent(searchQuery)}&limit=${limit}`;
