@@ -239,10 +239,26 @@ async function syncOneBrand(brandName, scentLimit, dryRun, env) {
       .trim();
   }
 
-  // Fetch Fragplace scents
+  // Look up Fragplace brand ID from R2 brands index
+  let fragplaceBrandId = null;
+  try {
+    const normBrandName = normalize(brandName);
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (indexObj) {
+      const brandIndex = JSON.parse(await indexObj.text());
+      const match = brandIndex.find(b => normalize(b.name) === normBrandName);
+      if (match) fragplaceBrandId = match.id;
+    }
+  } catch (_) {}
+
+  // Fetch Fragplace scents — by brand.id if available, else unfiltered + client-side
   let fragplaceScents = [];
   let fragplaceTotal = 0;
   try {
+    const query = { indexUid: "fragrances", q: "", limit: 1000, offset: 0 };
+    if (fragplaceBrandId !== null) {
+      query.filter = [`brand.id = ${fragplaceBrandId}`];
+    }
     const fpRes = await fetch(FRAGPLACE_URL, {
       method: "POST",
       headers: {
@@ -250,19 +266,23 @@ async function syncOneBrand(brandName, scentLimit, dryRun, env) {
         "x-rapidapi-host": RAPIDAPI_HOST,
         "x-rapidapi-key": env.RAPIDAPI_KEY,
       },
-      body: JSON.stringify({
-        queries: [{ indexUid: "fragrances", q: "", limit: 1000, offset: 0 }],
-      }),
+      body: JSON.stringify({ queries: [query] }),
     });
     if (fpRes.ok) {
       const fpData = await fpRes.json();
       const allHits = fpData?.results?.[0]?.hits || [];
       fragplaceTotal = fpData?.results?.[0]?.estimatedTotalHits ?? allHits.length;
-      const normBrand = normalize(brandName);
-      fragplaceScents = allHits.filter(h => {
-        const hBrand = normalize(h.brand?.name || h.brand || "");
-        return hBrand === normBrand || hBrand.includes(normBrand);
-      });
+      if (fragplaceBrandId !== null) {
+        // Filtered by brand ID — all hits belong to this brand
+        fragplaceScents = allHits;
+      } else {
+        // Fallback: client-side filter
+        const normBrand = normalize(brandName);
+        fragplaceScents = allHits.filter(h => {
+          const hBrand = normalize(h.brand?.name || h.brand || "");
+          return hBrand === normBrand || hBrand.includes(normBrand);
+        });
+      }
     }
   } catch (_) {}
 
@@ -910,6 +930,7 @@ async function handleProbeFragplace(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
   const rawBrandName = typeof body.brandName === "string" ? body.brandName.trim() : "";
+  const rawBrandId = typeof body.brandId === "number" ? body.brandId : null;
   const limit = body.limit || 100;
 
   const query = {
@@ -918,7 +939,9 @@ async function handleProbeFragplace(request, env) {
     limit,
     offset: 0,
   };
-  if (rawBrandName) {
+  if (rawBrandId !== null) {
+    query.filter = [`brand.id = ${rawBrandId}`];
+  } else if (rawBrandName) {
     query.filter = [`brand.name = "${rawBrandName}"`];
   }
 
