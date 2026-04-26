@@ -69,6 +69,10 @@ export default {
       return handleSyncProducts(request, env);
     }
 
+    if (url.pathname === "/api/sync-all-brands" && request.method === "POST") {
+      return handleSyncAllBrands(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -79,7 +83,8 @@ export default {
           "POST /api/rebuild-index     (processes one chunk; loop until done: true)",
           "POST /api/probe-fragplace   (read-only schema/EAN probe; brandName optional)",
           "POST /api/probe-fragella    (read-only scent search; scentName required, brandName optional)",
-          "POST /api/sync-products     (enrich + merge scents for a brand; writes to R2)",
+          "POST /api/sync-products     (enrich + merge scents for one brand; writes to R2)",
+          "POST /api/sync-all-brands   (processes one brand per call; loop until done: true)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -93,6 +98,323 @@ export default {
     ctx.waitUntil(rebuildFullLoop(env, "cron"));
   },
 };
+
+// ---------------------------------------------------------------------------
+// /api/sync-all-brands — full catalog sync across all brands in Vivantis pricelist.
+//
+// Processes ONE brand per call. The tester loops until done: true.
+// Progress is persisted in R2 so it survives dropped connections.
+//
+// POST body: {
+//   offset?: number,      // brand index to start at (0 = first brand)
+//   reset?: boolean,      // if true, restart from brand 0
+//   dryRun?: boolean,     // if true, no writes
+//   scentLimit?: number   // max scents per brand (default 50)
+// }
+// ---------------------------------------------------------------------------
+async function handleSyncAllBrands(request, env) {
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+  if (!env.FRAGELLA_API_KEY) return json({ error: "FRAGELLA_API_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const reset = body.reset === true;
+  const dryRun = body.dryRun === true;
+  const scentLimit = body.scentLimit || 50;
+
+  // Load Vivantis pricelist and extract unique brand names
+  let allBrands = [];
+  try {
+    const csvObj = await env.MASTER_DB.get("suppliers/vivantis/pricelist.csv");
+    if (!csvObj) return json({ error: "suppliers/vivantis/pricelist.csv not found in R2" }, 500);
+    const csvText = await csvObj.text();
+    const rows = parseCSV(csvText, ";");
+    const brandSet = new Set();
+    for (const row of rows) {
+      const b = (row["Brand"] || "").trim();
+      if (b) brandSet.add(b);
+    }
+    allBrands = Array.from(brandSet).sort();
+  } catch (err) {
+    return json({ error: `Pricelist load failed: ${err.message}` }, 500);
+  }
+
+  // Load or reset state
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalBrands: allBrands.length,
+    currentOffset: 0,
+    processed: 0,
+    totalScentsWritten: 0,
+    totalErrors: 0,
+    skippedNoBrands: 0,
+    brandResults: [],
+  };
+
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/sync-all-brands.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = typeof body.offset === "number" ? body.offset : state.currentOffset;
+
+  if (offset >= allBrands.length) {
+    return json({
+      done: true,
+      totalBrands: allBrands.length,
+      processed: state.processed,
+      totalScentsWritten: state.totalScentsWritten,
+      totalErrors: state.totalErrors,
+      skippedNoBrands: state.skippedNoBrands,
+      note: "All brands processed.",
+    });
+  }
+
+  const brandName = allBrands[offset];
+
+  // Run sync for this brand
+  const syncResult = await syncOneBrand(brandName, scentLimit, dryRun, env);
+
+  // Update state
+  state.currentOffset = offset + 1;
+  state.processed++;
+  state.totalScentsWritten += syncResult.written || 0;
+  state.totalErrors += syncResult.errors || 0;
+  if (syncResult.brandScentsFound === 0) state.skippedNoBrands++;
+
+  state.brandResults.push({
+    brand: brandName,
+    scentsFound: syncResult.brandScentsFound,
+    written: syncResult.written,
+    fragellaExact: syncResult.fragellaExactMatch,
+    fragellaNo: syncResult.fragellaNoMatch,
+    vivantisNo: syncResult.vivantisNoMatch,
+    errors: syncResult.errors,
+  });
+
+  const done = state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  if (!dryRun) {
+    await env.MASTER_DB.put(
+      "state/sync-all-brands.json",
+      JSON.stringify(state),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+  }
+
+  return json({
+    done,
+    brandName,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalBrands: allBrands.length,
+    processed: state.processed,
+    totalScentsWritten: state.totalScentsWritten,
+    totalErrors: state.totalErrors,
+    skippedNoBrands: state.skippedNoBrands,
+    thisBrand: syncResult,
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
+
+// Internal: sync one brand, return summary object
+async function syncOneBrand(brandName, scentLimit, dryRun, env) {
+  function normalize(str) {
+    return (str || "")
+      .toLowerCase()
+      .replace(/[`\u2018\u2019']/g, "")
+      .replace(/&/g, "and")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Fetch Fragplace scents
+  let fragplaceScents = [];
+  let fragplaceTotal = 0;
+  try {
+    const fpRes = await fetch(FRAGPLACE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": env.RAPIDAPI_KEY,
+      },
+      body: JSON.stringify({
+        queries: [{ indexUid: "fragrances", q: "", limit: 1000, offset: 0 }],
+      }),
+    });
+    if (fpRes.ok) {
+      const fpData = await fpRes.json();
+      const allHits = fpData?.results?.[0]?.hits || [];
+      fragplaceTotal = fpData?.results?.[0]?.estimatedTotalHits ?? allHits.length;
+      const normBrand = normalize(brandName);
+      fragplaceScents = allHits.filter(h => {
+        const hBrand = normalize(h.brand?.name || h.brand || "");
+        return hBrand === normBrand || hBrand.includes(normBrand);
+      });
+    }
+  } catch (_) {}
+
+  const page = fragplaceScents.slice(0, scentLimit);
+
+  if (page.length === 0) {
+    return { brandScentsFound: 0, written: 0, fragellaExactMatch: 0, fragellaPartialMatch: 0, fragellaNoMatch: 0, vivantisMatched: 0, vivantisNoMatch: 0, errors: 0 };
+  }
+
+  // Load Vivantis pricelist
+  let vivantisRows = [];
+  try {
+    const csvObj = await env.MASTER_DB.get("suppliers/vivantis/pricelist.csv");
+    if (csvObj) vivantisRows = parseCSV(await csvObj.text(), ";");
+  } catch (_) {}
+
+  function extractScentName(rawName) {
+    return rawName
+      .replace(/\s*-\s*(EDP|EDT|EDC|Parfum|Extrait|Cologne|EDP Refill|Hair Mist).*$/i, "")
+      .replace(/^[^-]+-\s*/, "")
+      .trim();
+  }
+
+  const vivantisIndex = {};
+  for (const row of vivantisRows) {
+    const rawName = (row["Name"] || "").trim();
+    if (!rawName) continue;
+    const normKey = normalize(extractScentName(rawName));
+    if (!vivantisIndex[normKey]) vivantisIndex[normKey] = [];
+    vivantisIndex[normKey].push(row);
+  }
+
+  const summary = {
+    brandScentsFound: fragplaceScents.length,
+    written: 0, fragellaExactMatch: 0, fragellaPartialMatch: 0, fragellaNoMatch: 0,
+    vivantisMatched: 0, vivantisNoMatch: 0, errors: 0,
+  };
+
+  const brandSlug = slugify(brandName);
+
+  for (const scent of page) {
+    const fragplaceId = scent.id;
+    const scentName = scent.name || "";
+    const scentSlug = slugify(scentName);
+
+    try {
+      // Fragella enrichment
+      let fragellaData = null;
+      let fragellaMatch = "none";
+      try {
+        const searchQuery = normalize(brandName + " " + scentName);
+        const feUrl = `${FRAGELLA_BASE}/fragrances?search=${encodeURIComponent(searchQuery)}&limit=5`;
+        const feRes = await fetch(feUrl, { headers: { "x-api-key": env.FRAGELLA_API_KEY } });
+        if (feRes.ok) {
+          const feRaw = await feRes.json();
+          const feHits = Array.isArray(feRaw) ? feRaw : (feRaw.data || feRaw.results || []);
+          const families = BRAND_FAMILIES[brandName] || [normalize(brandName)];
+          const filtered = feHits.filter(h => {
+            const b = normalize(h.Brand || h.brand || "");
+            return families.some(f => b.includes(f));
+          });
+          const normFull = normalize(brandName + " " + scentName);
+          const normScent = normalize(scentName);
+          const best =
+            filtered.find(h => normalize(h.Name || h.name) === normFull) ||
+            filtered.find(h => normalize(h.Name || h.name) === normScent) ||
+            filtered.find(h => normalize(h.Name || h.name).includes(normScent)) ||
+            filtered[0] || null;
+          if (best) {
+            const mn = normalize(best.Name || best.name);
+            fragellaMatch = (mn === normFull || mn === normScent) ? "exact" : "partial";
+            fragellaData = best;
+          }
+        }
+      } catch (_) {}
+
+      if (fragellaMatch === "exact") summary.fragellaExactMatch++;
+      else if (fragellaMatch === "partial") summary.fragellaPartialMatch++;
+      else summary.fragellaNoMatch++;
+
+      // Vivantis matching
+      const normScentKey = normalize(scentName);
+      let skuRows = vivantisIndex[normScentKey] || [];
+      if (skuRows.length === 0) {
+        for (const [key, rows] of Object.entries(vivantisIndex)) {
+          if (key.includes(normScentKey) || normScentKey.includes(key)) { skuRows = rows; break; }
+        }
+      }
+      if (skuRows.length > 0) summary.vivantisMatched++;
+      else summary.vivantisNoMatch++;
+
+      const variants = skuRows.map(row => {
+        const rawName = (row["Name"] || "").trim();
+        const volMatch = rawName.match(/Volume:\s*(\d+(?:\.\d+)?)\s*ml/i);
+        const concMatch = rawName.match(/\b(EDP|EDT|EDC|Parfum|Extrait|Cologne|EDP Refill|Hair Mist)\b/i);
+        return {
+          ean: (row["EAN"] || "").trim() || null,
+          ean1: (row["EAN 1"] || "").trim() || null,
+          code: (row["Code"] || "").trim() || null,
+          size_ml: volMatch ? parseFloat(volMatch[1]) : null,
+          concentration: concMatch ? concMatch[1].toUpperCase() : null,
+          wp_eur: parseFloat((row["WP w/o VAT"] || "0").replace(",", ".")) || null,
+          rp_eur: parseFloat((row["RP"] || "0").replace(",", ".")) || null,
+          in_stock: parseInt(row["In stock"] || "0", 10) || 0,
+          in_action: (row["In Action"] || "").trim() === "YES",
+          supplier: "vivantis",
+          rawName,
+        };
+      });
+
+      const catalogRecord = {
+        id: fragplaceId, slug: scentSlug, brandSlug, brand: brandName, name: scentName,
+        syncedAt: new Date().toISOString(),
+        fragplace: {
+          id: fragplaceId, popularityScore: scent.popularityScore ?? null,
+          reviewsScoreAvg: scent.reviewsScoreAvg ?? null, reviewsCount: scent.reviewsCount ?? null,
+          releasedAt: scent.releasedAt ?? null, status: scent.status ?? null,
+          notes: scent.notes || [], perfumers: scent.perfumers || [],
+          imageUrl: scent.image?.url || null,
+        },
+        fragella: fragellaData ? {
+          matchType: fragellaMatch, confidence: fragellaData.Confidence || null,
+          year: fragellaData.Year || null, country: fragellaData.Country || null,
+          gender: fragellaData.Gender || null, oilType: fragellaData.OilType || null,
+          longevity: fragellaData.Longevity || null, sillage: fragellaData.Sillage || null,
+          popularity: fragellaData.Popularity || null, rating: fragellaData.rating || null,
+          priceValue: fragellaData["Price Value"] || null, imageUrl: fragellaData["Image URL"] || null,
+          mainAccords: fragellaData["Main Accords"] || [],
+          mainAccordsPercentage: fragellaData["Main Accords Percentage"] || {},
+          generalNotes: fragellaData["General Notes"] || [], notes: fragellaData.Notes || {},
+          seasonRanking: fragellaData["Season Ranking"] || [],
+          occasionRanking: fragellaData["Occasion Ranking"] || [],
+          purchaseUrl: fragellaData["Purchase URL"] || null,
+        } : null,
+        variants, variantCount: variants.length, hasSupplierData: variants.length > 0,
+      };
+
+      if (!dryRun) {
+        await Promise.all([
+          env.MASTER_DB.put(`sources/fragplace/${fragplaceId}.json`, JSON.stringify(scent), { httpMetadata: { contentType: "application/json" } }),
+          ...(fragellaData ? [env.MASTER_DB.put(`sources/fragella/${fragplaceId}.json`, JSON.stringify(fragellaData), { httpMetadata: { contentType: "application/json" } })] : []),
+          env.MASTER_DB.put(`catalog/${brandSlug}/${fragplaceId}.json`, JSON.stringify(catalogRecord), { httpMetadata: { contentType: "application/json" } }),
+        ]);
+        summary.written++;
+      }
+    } catch (_) {
+      summary.errors++;
+    }
+  }
+
+  return summary;
+}
 
 // ---------------------------------------------------------------------------
 // /api/sync-products — enrich and merge scents for one brand, write to R2.
