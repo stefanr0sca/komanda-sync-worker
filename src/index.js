@@ -169,8 +169,11 @@ async function handleProbeFragella(request, env) {
       : hits;
 
     // Best match: exact normalized name → partial → first result
+    // Match against full "brand scent" string when brandName provided, scent alone otherwise
     const normScent = normalize(scentName);
+    const normFull = brandName ? normalize(brandName + " " + scentName) : normScent;
     const bestMatch =
+      filtered.find(h => normalize(h.Name || h.name) === normFull) ||
       filtered.find(h => normalize(h.Name || h.name) === normScent) ||
       filtered.find(h => normalize(h.Name || h.name).includes(normScent)) ||
       filtered[0] ||
@@ -180,13 +183,14 @@ async function handleProbeFragella(request, env) {
     const fieldsSeen = new Set();
     for (const h of hits) Object.keys(h).forEach(k => fieldsSeen.add(k));
 
+    const matchedNorm = bestMatch ? normalize(bestMatch.Name || bestMatch.name) : null;
     return json({
       scentName,
       brandName: brandName || null,
       searchQuery,
       totalHits: hits.length,
       filteredHits: filtered.length,
-      exactMatch: bestMatch ? normalize(bestMatch.Name || bestMatch.name) === normScent : false,
+      exactMatch: matchedNorm === normFull || matchedNorm === normScent,
       bestMatch,
       allFilteredHits: filtered,
       fieldsSeen: Array.from(fieldsSeen).sort(),
