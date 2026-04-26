@@ -65,6 +65,10 @@ export default {
       return handleProbeFragella(request, env);
     }
 
+    if (url.pathname === "/api/sync-products" && request.method === "POST") {
+      return handleSyncProducts(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -75,6 +79,7 @@ export default {
           "POST /api/rebuild-index     (processes one chunk; loop until done: true)",
           "POST /api/probe-fragplace   (read-only schema/EAN probe; brandName optional)",
           "POST /api/probe-fragella    (read-only scent search; scentName required, brandName optional)",
+          "POST /api/sync-products     (enrich + merge scents for a brand; writes to R2)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -88,6 +93,379 @@ export default {
     ctx.waitUntil(rebuildFullLoop(env, "cron"));
   },
 };
+
+// ---------------------------------------------------------------------------
+// /api/sync-products — enrich and merge scents for one brand, write to R2.
+//
+// Flow per scent:
+//   1. Fetch Fragplace scents (unfiltered, client-side filter by brand name)
+//   2. Load Vivantis pricelist from R2 (suppliers/vivantis/pricelist.csv)
+//   3. For each scent:
+//      a. Search Fragella → enrichment + confidence
+//      b. Find matching Vivantis SKUs by normalized scent name
+//      c. Build merged catalog record with variants array
+//      d. Write layered records to R2
+//   4. Return summary
+//
+// POST body: {
+//   brandName: string,    // required — e.g. "Lattafa"
+//   offset?: number,      // Fragplace pagination offset (default 0)
+//   limit?: number,       // max scents to process per call (default 20)
+//   dryRun?: boolean      // if true, return merged records without writing
+// }
+// ---------------------------------------------------------------------------
+async function handleSyncProducts(request, env) {
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+  if (!env.FRAGELLA_API_KEY) return json({ error: "FRAGELLA_API_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const brandName = (body.brandName || "").trim();
+  const offset = body.offset || 0;
+  const limit = body.limit || 20;
+  const dryRun = body.dryRun === true;
+
+  if (!brandName) return json({ error: "brandName is required" }, 400);
+
+  // ── Shared normalizer ────────────────────────────────────────────────────
+  function normalize(str) {
+    return (str || "")
+      .toLowerCase()
+      .replace(/[`''']/g, "")
+      .replace(/&/g, "and")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // ── Step 1: Fetch Fragplace scents (unfiltered, filter client-side) ──────
+  let fragplaceScents = [];
+  let fragplaceTotal = 0;
+  try {
+    const fpRes = await fetch(FRAGPLACE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": env.RAPIDAPI_KEY,
+      },
+      body: JSON.stringify({
+        queries: [{ indexUid: "fragrances", q: "", limit: 1000, offset: 0 }],
+      }),
+    });
+    if (!fpRes.ok) {
+      return json({ error: `Fragplace error ${fpRes.status}` }, fpRes.status);
+    }
+    const fpData = await fpRes.json();
+    const allHits = fpData?.results?.[0]?.hits || [];
+    fragplaceTotal = fpData?.results?.[0]?.estimatedTotalHits ?? allHits.length;
+
+    // Client-side filter by brand name (normalized)
+    const normBrand = normalize(brandName);
+    fragplaceScents = allHits.filter(h => {
+      const hBrand = normalize(h.brand?.name || h.brand || "");
+      return hBrand === normBrand || hBrand.includes(normBrand);
+    });
+  } catch (err) {
+    return json({ error: `Fragplace fetch failed: ${err.message}` }, 500);
+  }
+
+  // Apply offset + limit
+  const page = fragplaceScents.slice(offset, offset + limit);
+  const hasMore = offset + limit < fragplaceScents.length;
+
+  if (page.length === 0) {
+    return json({
+      brandName,
+      fragplaceTotal,
+      brandScentsFound: fragplaceScents.length,
+      offset,
+      limit,
+      processed: 0,
+      hasMore: false,
+      note: "No scents found for this brand at this offset.",
+    });
+  }
+
+  // ── Step 2: Load Vivantis pricelist from R2 ──────────────────────────────
+  let vivantisRows = [];
+  try {
+    const csvObj = await env.MASTER_DB.get("suppliers/vivantis/pricelist.csv");
+    if (!csvObj) return json({ error: "suppliers/vivantis/pricelist.csv not found in R2" }, 500);
+    const csvText = await csvObj.text();
+    vivantisRows = parseCSV(csvText, ";");
+  } catch (err) {
+    return json({ error: `Pricelist load failed: ${err.message}` }, 500);
+  }
+
+  // Pre-build Vivantis scent name index: normalized scent name → [rows]
+  function extractScentName(rawName) {
+    return rawName
+      .replace(/\s*-\s*(EDP|EDT|EDC|Parfum|Extrait|Cologne|EDP Refill|Hair Mist).*$/i, "")
+      .replace(/^[^-]+-\s*/, "") // strip "BrandName - " prefix if present
+      .trim();
+  }
+
+  const vivantisIndex = {};
+  for (const row of vivantisRows) {
+    const rawName = (row["Name"] || "").trim();
+    if (!rawName) continue;
+    const scentRaw = extractScentName(rawName);
+    const normKey = normalize(scentRaw);
+    if (!vivantisIndex[normKey]) vivantisIndex[normKey] = [];
+    vivantisIndex[normKey].push(row);
+  }
+
+  // ── Step 3: Process each scent ───────────────────────────────────────────
+  const results = [];
+  const summary = {
+    processed: 0,
+    fragellaExactMatch: 0,
+    fragellaPartialMatch: 0,
+    fragellaNoMatch: 0,
+    vivantisMatched: 0,
+    vivantisNoMatch: 0,
+    written: 0,
+    errors: 0,
+  };
+
+  for (const scent of page) {
+    summary.processed++;
+    const fragplaceId = scent.id;
+    const scentName = scent.name || "";
+    const brandSlug = slugify(brandName);
+    const scentSlug = slugify(scentName);
+
+    try {
+      // ── 3a: Fragella enrichment ──────────────────────────────────────────
+      let fragellaData = null;
+      let fragellaMatch = "none";
+      try {
+        const searchQuery = normalize(brandName + " " + scentName);
+        const feUrl = `${FRAGELLA_BASE}/fragrances?search=${encodeURIComponent(searchQuery)}&limit=5`;
+        const feRes = await fetch(feUrl, {
+          headers: { "x-api-key": env.FRAGELLA_API_KEY },
+        });
+        if (feRes.ok) {
+          const feRaw = await feRes.json();
+          const feHits = Array.isArray(feRaw) ? feRaw : (feRaw.data || feRaw.results || []);
+
+          // Filter by brand family
+          const families = BRAND_FAMILIES[brandName] || [normalize(brandName)];
+          const filtered = feHits.filter(h => {
+            const b = normalize(h.Brand || h.brand || "");
+            return families.some(f => b.includes(f));
+          });
+
+          const normFull = normalize(brandName + " " + scentName);
+          const normScent = normalize(scentName);
+          const best =
+            filtered.find(h => normalize(h.Name || h.name) === normFull) ||
+            filtered.find(h => normalize(h.Name || h.name) === normScent) ||
+            filtered.find(h => normalize(h.Name || h.name).includes(normScent)) ||
+            filtered[0] || null;
+
+          if (best) {
+            const matchedNorm = normalize(best.Name || best.name);
+            fragellaMatch = (matchedNorm === normFull || matchedNorm === normScent) ? "exact" : "partial";
+            fragellaData = best;
+          }
+        }
+      } catch (_) {}
+
+      if (fragellaMatch === "exact") summary.fragellaExactMatch++;
+      else if (fragellaMatch === "partial") summary.fragellaPartialMatch++;
+      else summary.fragellaNoMatch++;
+
+      // ── 3b: Vivantis SKU matching ────────────────────────────────────────
+      const normScentKey = normalize(scentName);
+      const matchedRows = vivantisIndex[normScentKey] || [];
+
+      // Fallback: partial match if exact fails
+      let skuRows = matchedRows;
+      if (skuRows.length === 0) {
+        // Try partial — scent name contains or is contained by vivantis key
+        for (const [key, rows] of Object.entries(vivantisIndex)) {
+          if (key.includes(normScentKey) || normScentKey.includes(key)) {
+            skuRows = rows;
+            break;
+          }
+        }
+      }
+
+      if (skuRows.length > 0) summary.vivantisMatched++;
+      else summary.vivantisNoMatch++;
+
+      // Build variants array from matched Vivantis rows
+      const variants = skuRows.map(row => {
+        const rawName = (row["Name"] || "").trim();
+        // Extract size_ml from "Volume: 100 ml"
+        const volMatch = rawName.match(/Volume:\s*(\d+(?:\.\d+)?)\s*ml/i);
+        const sizeMl = volMatch ? parseFloat(volMatch[1]) : null;
+        // Extract concentration
+        const concMatch = rawName.match(/\b(EDP|EDT|EDC|Parfum|Extrait|Cologne|EDP Refill|Hair Mist)\b/i);
+        const concentration = concMatch ? concMatch[1].toUpperCase() : null;
+
+        return {
+          ean: (row["EAN"] || "").trim() || null,
+          ean1: (row["EAN 1"] || "").trim() || null,
+          code: (row["Code"] || "").trim() || null,
+          size_ml: sizeMl,
+          concentration,
+          wp_eur: parseFloat((row["WP w/o VAT"] || "0").replace(",", ".")) || null,
+          rp_eur: parseFloat((row["RP"] || "0").replace(",", ".")) || null,
+          in_stock: parseInt(row["In stock"] || "0", 10) || 0,
+          in_action: (row["In Action"] || "").trim() === "YES",
+          supplier: "vivantis",
+          rawName,
+        };
+      });
+
+      // ── 3c: Build merged catalog record ─────────────────────────────────
+      const catalogRecord = {
+        id: fragplaceId,
+        slug: scentSlug,
+        brandSlug,
+        brand: brandName,
+        name: scentName,
+        syncedAt: new Date().toISOString(),
+
+        // Fragplace fields
+        fragplace: {
+          id: fragplaceId,
+          popularityScore: scent.popularityScore ?? null,
+          reviewsScoreAvg: scent.reviewsScoreAvg ?? null,
+          reviewsCount: scent.reviewsCount ?? null,
+          releasedAt: scent.releasedAt ?? null,
+          status: scent.status ?? null,
+          notes: scent.notes || [],
+          perfumers: scent.perfumers || [],
+          imageUrl: scent.image?.url || null,
+        },
+
+        // Fragella enrichment (null if not found)
+        fragella: fragellaData ? {
+          matchType: fragellaMatch,
+          confidence: fragellaData.Confidence || null,
+          year: fragellaData.Year || null,
+          country: fragellaData.Country || null,
+          gender: fragellaData.Gender || null,
+          oilType: fragellaData.OilType || null,
+          longevity: fragellaData.Longevity || null,
+          sillage: fragellaData.Sillage || null,
+          popularity: fragellaData.Popularity || null,
+          rating: fragellaData.rating || null,
+          priceValue: fragellaData["Price Value"] || null,
+          imageUrl: fragellaData["Image URL"] || null,
+          mainAccords: fragellaData["Main Accords"] || [],
+          mainAccordsPercentage: fragellaData["Main Accords Percentage"] || {},
+          generalNotes: fragellaData["General Notes"] || [],
+          notes: fragellaData.Notes || {},
+          seasonRanking: fragellaData["Season Ranking"] || [],
+          occasionRanking: fragellaData["Occasion Ranking"] || [],
+          purchaseUrl: fragellaData["Purchase URL"] || null,
+        } : null,
+
+        // Commerce layer
+        variants,
+        variantCount: variants.length,
+        hasSupplierData: variants.length > 0,
+      };
+
+      const result = {
+        fragplaceId,
+        scentName,
+        fragellaMatch,
+        variantCount: variants.length,
+      };
+
+      if (!dryRun) {
+        // Write layered records to R2
+        const writes = [
+          // Raw Fragplace source
+          env.MASTER_DB.put(
+            `sources/fragplace/${fragplaceId}.json`,
+            JSON.stringify(scent),
+            { httpMetadata: { contentType: "application/json" } }
+          ),
+          // Raw Fragella source (if found)
+          ...(fragellaData ? [env.MASTER_DB.put(
+            `sources/fragella/${fragplaceId}.json`,
+            JSON.stringify(fragellaData),
+            { httpMetadata: { contentType: "application/json" } }
+          )] : []),
+          // Merged catalog record
+          env.MASTER_DB.put(
+            `catalog/${brandSlug}/${fragplaceId}.json`,
+            JSON.stringify(catalogRecord),
+            { httpMetadata: { contentType: "application/json" } }
+          ),
+        ];
+        await Promise.all(writes);
+        summary.written++;
+        result.written = true;
+      } else {
+        result.dryRun = true;
+        result.catalogRecord = catalogRecord;
+      }
+
+      results.push(result);
+    } catch (err) {
+      summary.errors++;
+      results.push({ fragplaceId, scentName, error: err.message });
+    }
+  }
+
+  return json({
+    brandName,
+    dryRun,
+    fragplaceTotal,
+    brandScentsFound: fragplaceScents.length,
+    offset,
+    limit,
+    hasMore,
+    nextOffset: hasMore ? offset + limit : null,
+    summary,
+    results,
+  });
+}
+
+// ── Simple CSV parser (handles semicolon delimiter + quoted fields) ──────────
+function parseCSV(text, delimiter = ";") {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = splitCSVLine(lines[0], delimiter);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = splitCSVLine(lines[i], delimiter);
+    if (values.length === 0) continue;
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = values[idx] || ""; });
+    rows.push(row);
+  }
+  return rows;
+}
+
+function splitCSVLine(line, delimiter) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // /api/probe-fragella — read-only Fragella search probe.
