@@ -73,6 +73,10 @@ export default {
       return handleSyncAllBrands(request, env);
     }
 
+    if (url.pathname === "/api/sync-fragplace-all" && request.method === "POST") {
+      return handleSyncFragplaceAll(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -85,6 +89,7 @@ export default {
           "POST /api/probe-fragella    (read-only scent search; scentName required, brandName optional)",
           "POST /api/sync-products     (enrich + merge scents for one brand; writes to R2)",
           "POST /api/sync-all-brands   (processes one brand per call; loop until done: true)",
+          "POST /api/sync-fragplace-all (Phase 1: full Fragplace scent sync by brand ID; no enrichment)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -98,6 +103,206 @@ export default {
     ctx.waitUntil(rebuildFullLoop(env, "cron"));
   },
 };
+
+
+// ---------------------------------------------------------------------------
+// /api/sync-fragplace-all — Phase 1: full Fragplace scent sync.
+//
+// Loops through ALL brands in the Fragplace brands index (R2),
+// queries each by brand.id, writes raw scent records and minimal
+// catalog stubs. No Fragella, no Vivantis — pure speed.
+//
+// One brand per call. Tester loops until done: true.
+// Progress persisted in R2 — safe to resume.
+//
+// POST body: {
+//   offset?: number,      // brand index offset (default: resume from state)
+//   reset?: boolean,      // restart from brand 0
+//   limit?: number        // max scents per brand (default 1000 = all)
+// }
+// ---------------------------------------------------------------------------
+async function handleSyncFragplaceAll(request, env) {
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const reset = body.reset === true;
+  const scentLimit = body.limit || 1000;
+
+  // Load Fragplace brands index from R2
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return json({ error: "brands/index.json not found — run sync-brands first" }, 500);
+    allBrands = JSON.parse(await indexObj.text());
+  } catch (err) {
+    return json({ error: `Brand index load failed: ${err.message}` }, 500);
+  }
+
+  // Load or reset state
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalBrands: allBrands.length,
+    currentOffset: 0,
+    processed: 0,
+    totalScentsWritten: 0,
+    totalSkipped: 0,
+    totalErrors: 0,
+    brandResults: [],
+  };
+
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/sync-fragplace-all.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = typeof body.offset === "number" ? body.offset : state.currentOffset;
+
+  if (offset >= allBrands.length) {
+    return json({
+      done: true,
+      totalBrands: allBrands.length,
+      processed: state.processed,
+      totalScentsWritten: state.totalScentsWritten,
+      totalSkipped: state.totalSkipped,
+      totalErrors: state.totalErrors,
+      note: "All Fragplace brands processed.",
+    });
+  }
+
+  const brand = allBrands[offset];
+  const brandId = brand.id;
+  const brandName = brand.name || "";
+  const brandSlug = slugify(brandName);
+
+  // Fetch scents for this brand by ID
+  let scentsWritten = 0;
+  let scentsFound = 0;
+  let errors = 0;
+
+  try {
+    const fpRes = await fetch(FRAGPLACE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": env.RAPIDAPI_KEY,
+      },
+      body: JSON.stringify({
+        queries: [{
+          indexUid: "fragrances",
+          q: "",
+          filter: [`brand.id = ${brandId}`],
+          limit: scentLimit,
+          offset: 0,
+        }],
+      }),
+    });
+
+    if (fpRes.ok) {
+      const fpData = await fpRes.json();
+      const hits = fpData?.results?.[0]?.hits || [];
+      scentsFound = hits.length;
+
+      const writes = hits.map(scent => {
+        const scentSlug = slugify(scent.name || "");
+        const catalogRecord = {
+          id: scent.id,
+          slug: scentSlug,
+          brandSlug,
+          brand: brandName,
+          brandId,
+          name: scent.name || "",
+          eans: [],           // populated during SKU attachment pass
+          syncedAt: new Date().toISOString(),
+          fragplace: {
+            id: scent.id,
+            popularityScore: scent.popularityScore ?? null,
+            reviewsScoreAvg: scent.reviewsScoreAvg ?? null,
+            reviewsCount: scent.reviewsCount ?? null,
+            releasedAt: scent.releasedAt ?? null,
+            status: scent.status ?? null,
+            notes: scent.notes || [],
+            perfumers: scent.perfumers || [],
+            imageUrl: scent.image?.url || null,
+          },
+          fragella: null,     // populated during Fragella enrichment pass
+          variants: [],       // populated during SKU attachment pass
+          variantCount: 0,
+          hasSupplierData: false,
+        };
+
+        return Promise.all([
+          // Raw Fragplace source
+          env.MASTER_DB.put(
+            `sources/fragplace/${scent.id}.json`,
+            JSON.stringify(scent),
+            { httpMetadata: { contentType: "application/json" } }
+          ),
+          // Catalog stub
+          env.MASTER_DB.put(
+            `catalog/${brandSlug}/${scent.id}.json`,
+            JSON.stringify(catalogRecord),
+            { httpMetadata: { contentType: "application/json" } }
+          ),
+        ]);
+      });
+
+      await Promise.all(writes);
+      scentsWritten = hits.length;
+    }
+  } catch (err) {
+    errors++;
+  }
+
+  // Update state
+  state.currentOffset = offset + 1;
+  state.processed++;
+  state.totalScentsWritten += scentsWritten;
+  state.totalErrors += errors;
+  if (scentsFound === 0) state.totalSkipped++;
+
+  state.brandResults.push({
+    brand: brandName,
+    brandId,
+    scentsFound,
+    written: scentsWritten,
+    errors,
+  });
+
+  const done = state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  await env.MASTER_DB.put(
+    "state/sync-fragplace-all.json",
+    JSON.stringify(state),
+    { httpMetadata: { contentType: "application/json" } }
+  );
+
+  return json({
+    done,
+    brandName,
+    brandId,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalBrands: allBrands.length,
+    processed: state.processed,
+    totalScentsWritten: state.totalScentsWritten,
+    totalSkipped: state.totalSkipped,
+    totalErrors: state.totalErrors,
+    thisBrand: { scentsFound, written: scentsWritten, errors },
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // /api/sync-all-brands — full catalog sync across all brands in Vivantis pricelist.
