@@ -77,6 +77,10 @@ export default {
       return handleSyncFragplaceAll(request, env);
     }
 
+    if (url.pathname === "/api/sync-brand-stubs" && request.method === "POST") {
+      return handleSyncBrandStubs(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -90,6 +94,7 @@ export default {
           "POST /api/sync-products     (enrich + merge scents for one brand; writes to R2)",
           "POST /api/sync-all-brands   (processes one brand per call; loop until done: true)",
           "POST /api/sync-fragplace-all (Phase 1: full Fragplace scent sync by brand ID; no enrichment)",
+          "POST /api/sync-brand-stubs   (write catalog-brands stubs for brands with 0 Fragplace scents)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -104,6 +109,83 @@ export default {
   },
 };
 
+
+// ---------------------------------------------------------------------------
+// /api/sync-brand-stubs — write catalog-brands stubs for brands that
+// returned 0 scents in Phase 1 (not in Fragplace's scent index).
+//
+// Reads state/sync-fragplace-all.json to find skipped brands,
+// writes a minimal stub to catalog-brands/{brand-slug}.json for each.
+// Single call — no looping needed, only ~72 brands.
+//
+// POST body: {} (no parameters needed)
+// ---------------------------------------------------------------------------
+async function handleSyncBrandStubs(request, env) {
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  // Load Phase 1 state to find skipped brands
+  let skippedBrands = [];
+  try {
+    const stateObj = await env.MASTER_DB.get("state/sync-fragplace-all.json");
+    if (!stateObj) return json({ error: "state/sync-fragplace-all.json not found — run Phase 1 first" }, 500);
+    const state = JSON.parse(await stateObj.text());
+    skippedBrands = (state.brandResults || []).filter(b => b.scentsFound === 0);
+  } catch (err) {
+    return json({ error: `State load failed: ${err.message}` }, 500);
+  }
+
+  if (skippedBrands.length === 0) {
+    return json({ note: "No skipped brands found in Phase 1 state.", written: 0 });
+  }
+
+  // Also load the full brand index to get popularityScore + logoUrl
+  let brandIndex = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (indexObj) brandIndex = JSON.parse(await indexObj.text());
+  } catch (_) {}
+
+  const brandIndexById = {};
+  for (const b of brandIndex) brandIndexById[b.id] = b;
+
+  const syncedAt = new Date().toISOString();
+  let written = 0;
+  const results = [];
+
+  await Promise.all(skippedBrands.map(async (b) => {
+    const brandMeta = brandIndexById[b.brandId] || {};
+    const stub = {
+      brandId: b.brandId,
+      name: b.brand,
+      slug: slugify(b.brand),
+      popularityScore: brandMeta.popularityScore ?? null,
+      logoUrl: brandMeta.logoUrl || null,
+      source: "fragplace-brands-index",
+      fragplaceScents: 0,
+      syncedAt,
+      note: "Brand exists in Fragplace brand index but has no scents in the fragrances index.",
+    };
+
+    try {
+      await env.MASTER_DB.put(
+        `catalog-brands/${stub.slug}.json`,
+        JSON.stringify(stub),
+        { httpMetadata: { contentType: "application/json" } }
+      );
+      written++;
+      results.push({ brand: b.brand, slug: stub.slug, written: true });
+    } catch (err) {
+      results.push({ brand: b.brand, slug: stub.slug, error: err.message });
+    }
+  }));
+
+  return json({
+    written,
+    total: skippedBrands.length,
+    results,
+    syncedAt,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // /api/sync-fragplace-all — Phase 1: full Fragplace scent sync.
