@@ -1,4 +1,4 @@
-// src/index.js // v2
+// src/index.js
 // Fragplace catalog → R2 sync worker
 // Endpoints:
 //   GET  /                      -> health + endpoint list
