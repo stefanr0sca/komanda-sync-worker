@@ -370,6 +370,7 @@ async function handleSyncFragplaceAll(request, env) {
 
   const reset = body.reset === true;
   const scentLimit = body.limit || 1000;
+  const skipExisting = body.skipExisting !== false; // default true
 
   // Load Fragplace brands index from R2
   let allBrands = [];
@@ -422,6 +423,24 @@ async function handleSyncFragplaceAll(request, env) {
   const brandId = brand.id;
   const brandName = brand.name || "";
   const brandSlug = slugify(brandName);
+
+  // Skip if brand already has catalog entries (skipExisting mode)
+  if (skipExisting) {
+    try {
+      const existing = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1 });
+      if (existing.objects.length > 0) {
+        state.currentOffset = offset + 1;
+        state.processed++;
+        state.totalSkipped++;
+        state.brandResults.push({ brand: brandName, brandId, scentsFound: 0, written: 0, skipped: true });
+        const done = state.currentOffset >= allBrands.length;
+        state.status = done ? "done" : "running";
+        if (done) state.finishedAt = new Date().toISOString();
+        await env.MASTER_DB.put("state/sync-fragplace-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+        return json({ done, brandName, brandId, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, processed: state.processed, totalScentsWritten: state.totalScentsWritten, totalSkipped: state.totalSkipped, totalErrors: state.totalErrors, thisBrand: { skipped: true, reason: "already exists" }, finishedAt: done ? state.finishedAt : null });
+      }
+    } catch (_) {}
+  }
 
   // Fetch scents for this brand by ID
   let scentsWritten = 0;
