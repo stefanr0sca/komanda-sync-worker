@@ -81,6 +81,10 @@ export default {
       return handleSyncBrandStubs(request, env);
     }
 
+    if (url.pathname === "/api/sync-brands-full" && request.method === "POST") {
+      return handleSyncBrandsFull(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -95,6 +99,7 @@ export default {
           "POST /api/sync-all-brands   (processes one brand per call; loop until done: true)",
           "POST /api/sync-fragplace-all (Phase 1: full Fragplace scent sync by brand ID; no enrichment)",
           "POST /api/sync-brand-stubs   (write catalog-brands stubs for brands with 0 Fragplace scents)",
+          "POST /api/sync-brands-full   (discover all brands via A-Z/0-9/year queries; one query per call)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -109,6 +114,159 @@ export default {
   },
 };
 
+
+// ---------------------------------------------------------------------------
+// /api/sync-brands-full — full brand discovery via exhaustive query strategy.
+//
+// Fragplace caps unfiltered brand queries at 1000. To discover all brands,
+// we query with multiple search terms that each return different windows:
+//   - Letters a-z
+//   - Digits 0-9
+//   - Years 1920-2024
+//
+// Each query returns up to 1000 brands. Results are deduplicated by brand ID.
+// Only NEW brands (not already in R2) are written. Progress is saved to R2.
+// One query per call — tester loops until done: true.
+//
+// POST body: {
+//   reset?: boolean   // restart from first query
+// }
+// ---------------------------------------------------------------------------
+async function handleSyncBrandsFull(request, env) {
+  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const reset = body.reset === true;
+
+  // Build the full query list
+  const queries = [];
+  // Letters a-z
+  for (let i = 0; i < 26; i++) queries.push(String.fromCharCode(97 + i));
+  // Digits 0-9
+  for (let i = 0; i <= 9; i++) queries.push(String(i));
+  // Years 1920-2024
+  for (let y = 1920; y <= 2024; y++) queries.push(String(y));
+  // Total: ~141 queries
+
+  // Load or reset state
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalQueries: queries.length,
+    currentOffset: 0,
+    totalFound: 0,
+    totalNew: 0,
+    totalSkipped: 0,
+    seenIds: [],
+  };
+
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/sync-brands-full.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = state.currentOffset;
+
+  if (offset >= queries.length) {
+    return json({
+      done: true,
+      totalQueries: queries.length,
+      totalFound: state.totalFound,
+      totalNew: state.totalNew,
+      note: "All brand discovery queries complete.",
+    });
+  }
+
+  const q = queries[offset];
+  const seenIds = new Set(state.seenIds || []);
+
+  // Fetch brands for this query term
+  let hits = [];
+  try {
+    const res = await fetch(FRAGPLACE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": env.RAPIDAPI_KEY,
+      },
+      body: JSON.stringify({
+        queries: [{ indexUid: "brands", q, limit: 1000, offset: 0 }],
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      hits = data?.results?.[0]?.hits || [];
+    }
+  } catch (_) {}
+
+  // Deduplicate: only process brands we haven't seen yet
+  const newBrands = hits.filter(b => !seenIds.has(b.id));
+
+  // Write new brands to R2
+  let written = 0;
+  if (newBrands.length > 0) {
+    const writes = newBrands.map(b => {
+      seenIds.add(b.id);
+      const record = {
+        id: b.id,
+        name: b.name || "",
+        slug: slugify(b.name),
+        popularityScore: b.popularityScore ?? null,
+        description: b.description || "",
+        logoUrl: b.image?.url || "",
+        status: b.status || "",
+        syncedAt: new Date().toISOString(),
+        raw: b,
+      };
+      return env.MASTER_DB.put(
+        `brands/${b.id}.json`,
+        JSON.stringify(record),
+        { httpMetadata: { contentType: "application/json" } }
+      );
+    });
+    await Promise.all(writes);
+    written = newBrands.length;
+  }
+
+  // Update state
+  state.currentOffset = offset + 1;
+  state.totalFound += hits.length;
+  state.totalNew += written;
+  state.totalSkipped += (hits.length - written);
+  state.seenIds = Array.from(seenIds);
+
+  const done = state.currentOffset >= queries.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  await env.MASTER_DB.put(
+    "state/sync-brands-full.json",
+    JSON.stringify(state),
+    { httpMetadata: { contentType: "application/json" } }
+  );
+
+  return json({
+    done,
+    query: q,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalQueries: queries.length,
+    hitsThisQuery: hits.length,
+    newThisQuery: written,
+    totalFound: state.totalFound,
+    totalNew: state.totalNew,
+    uniqueBrandsSoFar: seenIds.size,
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // /api/sync-brand-stubs — write catalog-brands stubs for brands that
