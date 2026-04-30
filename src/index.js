@@ -85,6 +85,10 @@ export default {
       return handleSyncBrandsFull(request, env);
     }
 
+    if (url.pathname === "/api/sync-fragella-all" && request.method === "POST") {
+      return handleSyncFragellaAll(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -100,6 +104,7 @@ export default {
           "POST /api/sync-fragplace-all (Phase 1: full Fragplace scent sync by brand ID; no enrichment)",
           "POST /api/sync-brand-stubs   (write catalog-brands stubs for brands with 0 Fragplace scents)",
           "POST /api/sync-brands-full   (discover all brands via A-Z/0-9/year queries; one query per call)",
+          "POST /api/sync-fragella-all  (Phase 2: Fragella enrichment via brand endpoint; one brand per call)",
         ],
         cron: "Rebuild runs automatically every 6 hours.",
       });
@@ -1823,7 +1828,277 @@ async function listAllKeys(env, prefix) {
   return keys;
 }
 
-function slugify(s) {
+// ---------------------------------------------------------------------------
+// /api/sync-fragella-all — Phase 2: Fragella enrichment via brand endpoint.
+//
+// For each brand in the Fragplace index, calls GET /api/v1/brands/{name}
+// once to get all Fragella scents for that brand. Matches to catalog records
+// by normalized scent name and updates fragella field in place.
+//
+// One brand per call — tester loops until done: true.
+// Progress persisted in R2 — safe to resume.
+// Skips brands already enriched (any catalog record has fragella != null).
+//
+// Cost: ~1 Fragella API call per brand = ~6006 calls = ~$30
+//
+// POST body: {
+//   reset?: boolean   // restart from brand 0
+// }
+// ---------------------------------------------------------------------------
+async function handleSyncFragellaAll(request, env) {
+  if (!env.FRAGELLA_API_KEY) return json({ error: "FRAGELLA_API_KEY not configured" }, 500);
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const reset = body.reset === true;
+
+  function normalize(str) {
+    return (str || "")
+      .toLowerCase()
+      .replace(/[`\u2018\u2019''']/g, "")
+      .replace(/&/g, "and")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Load brand index
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
+    allBrands = JSON.parse(await indexObj.text());
+  } catch (err) {
+    return json({ error: `Brand index load failed: ${err.message}` }, 500);
+  }
+
+  // Load or reset state
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalBrands: allBrands.length,
+    currentOffset: 0,
+    processed: 0,
+    totalEnriched: 0,
+    totalNoMatch: 0,
+    totalSkipped: 0,
+    totalErrors: 0,
+  };
+
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/sync-fragella-all.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = state.currentOffset;
+
+  if (offset >= allBrands.length) {
+    return json({
+      done: true,
+      totalBrands: allBrands.length,
+      processed: state.processed,
+      totalEnriched: state.totalEnriched,
+      totalNoMatch: state.totalNoMatch,
+      totalSkipped: state.totalSkipped,
+      note: "All brands enriched.",
+    });
+  }
+
+  const brand = allBrands[offset];
+  const brandName = brand.name || "";
+  const brandSlug = slugify(brandName);
+
+  // Check if brand already enriched — peek at first catalog record
+  try {
+    const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1 });
+    if (listRes.objects.length > 0) {
+      const firstObj = await env.MASTER_DB.get(listRes.objects[0].key);
+      if (firstObj) {
+        const firstRecord = JSON.parse(await firstObj.text());
+        if (firstRecord.fragella !== null && firstRecord.fragella !== undefined) {
+          // Already enriched — skip
+          state.currentOffset = offset + 1;
+          state.processed++;
+          state.totalSkipped++;
+          const done = state.currentOffset >= allBrands.length;
+          state.status = done ? "done" : "running";
+          if (done) state.finishedAt = new Date().toISOString();
+          await env.MASTER_DB.put("state/sync-fragella-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+          return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, processed: state.processed, totalEnriched: state.totalEnriched, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "already enriched" } });
+        }
+      }
+    } else {
+      // No catalog records for this brand — skip
+      state.currentOffset = offset + 1;
+      state.processed++;
+      state.totalSkipped++;
+      const done = state.currentOffset >= allBrands.length;
+      state.status = done ? "done" : "running";
+      if (done) state.finishedAt = new Date().toISOString();
+      await env.MASTER_DB.put("state/sync-fragella-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+      return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, processed: state.processed, totalEnriched: state.totalEnriched, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "no catalog records" } });
+    }
+  } catch (_) {}
+
+  // Fetch all Fragella scents for this brand
+  let fragellaHits = [];
+  let fragellaError = null;
+  try {
+    // Try brand name as-is first, then with common prefixes stripped
+    const brandVariants = [
+      brandName,
+      brandName.replace(/^(Parfums?|Maison|House of|The|Les?|By)\s+/i, ""),
+    ].filter((v, i, a) => a.indexOf(v) === i);
+
+    for (const variant of brandVariants) {
+      const url = `${FRAGELLA_BASE}/brands/${encodeURIComponent(variant)}?limit=500`;
+      const res = await fetch(url, { headers: { "x-api-key": env.FRAGELLA_API_KEY } });
+      if (res.ok) {
+        const raw = await res.json();
+        const hits = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+        if (hits.length > 0) { fragellaHits = hits; break; }
+      }
+    }
+  } catch (err) {
+    fragellaError = err.message;
+  }
+
+  if (fragellaHits.length === 0) {
+    // No Fragella data for this brand
+    state.currentOffset = offset + 1;
+    state.processed++;
+    state.totalNoMatch++;
+    const done = state.currentOffset >= allBrands.length;
+    state.status = done ? "done" : "running";
+    if (done) state.finishedAt = new Date().toISOString();
+    await env.MASTER_DB.put("state/sync-fragella-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+    return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, processed: state.processed, totalEnriched: state.totalEnriched, totalNoMatch: state.totalNoMatch, thisBrand: { fragellaHits: 0, enriched: 0, error: fragellaError } });
+  }
+
+  // Build normalized Fragella name index
+  const fragellaIndex = {};
+  for (const h of fragellaHits) {
+    const normName = normalize(h.Name || h.name || "");
+    if (normName) fragellaIndex[normName] = h;
+  }
+
+  // List all catalog records for this brand
+  let catalogKeys = [];
+  try {
+    let cursor;
+    do {
+      const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+      cursor = listRes.truncated ? listRes.cursor : null;
+    } while (cursor);
+  } catch (_) {}
+
+  let enriched = 0;
+  let noMatch = 0;
+
+  // Process in batches of 50 to avoid timeout
+  const batch = catalogKeys.slice(0, 50);
+
+  await Promise.all(batch.map(async (key) => {
+    try {
+      const obj = await env.MASTER_DB.get(key);
+      if (!obj) return;
+      const record = JSON.parse(await obj.text());
+      if (record.fragella !== null && record.fragella !== undefined) return; // already done
+
+      const normName = normalize(record.name || "");
+
+      // Match: exact → contains → partial
+      let fragellaData =
+        fragellaIndex[normName] ||
+        Object.entries(fragellaIndex).find(([k]) => k === normName)?.[1] ||
+        Object.entries(fragellaIndex).find(([k]) => k.includes(normName) && normName.length > 4)?.[1] ||
+        Object.entries(fragellaIndex).find(([k]) => normName.includes(k) && k.length > 4)?.[1] ||
+        null;
+
+      if (!fragellaData) { noMatch++; return; }
+
+      record.fragella = {
+        matchType: "brand-endpoint",
+        confidence: fragellaData.Confidence || null,
+        year: fragellaData.Year || null,
+        country: fragellaData.Country || null,
+        gender: fragellaData.Gender || null,
+        oilType: fragellaData.OilType || null,
+        longevity: fragellaData.Longevity || null,
+        sillage: fragellaData.Sillage || null,
+        popularity: fragellaData.Popularity || null,
+        rating: fragellaData.rating || null,
+        priceValue: fragellaData["Price Value"] || null,
+        price: fragellaData.Price || null,
+        imageUrl: fragellaData["Image URL"] || null,
+        imageFallbacks: fragellaData["Image Fallbacks"] || [],
+        purchaseUrl: fragellaData["Purchase URL"] || null,
+        mainAccords: fragellaData["Main Accords"] || [],
+        mainAccordsPercentage: fragellaData["Main Accords Percentage"] || {},
+        generalNotes: fragellaData["General Notes"] || [],
+        notes: fragellaData.Notes || {},
+        seasonRanking: fragellaData["Season Ranking"] || [],
+        occasionRanking: fragellaData["Occasion Ranking"] || [],
+      };
+      record.syncedAt = new Date().toISOString();
+
+      await Promise.all([
+        env.MASTER_DB.put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } }),
+        env.MASTER_DB.put(`sources/fragella/${record.id}.json`, JSON.stringify(fragellaData), { httpMetadata: { contentType: "application/json" } }),
+      ]);
+      enriched++;
+    } catch (_) {}
+  }));
+
+  // Only advance offset if all catalog records for this brand are processed
+  // (if brand has >50 scents, we'll come back next call with same offset)
+  const fullyDone = batch.length === catalogKeys.length || batch.length < 50;
+
+  if (fullyDone) {
+    state.currentOffset = offset + 1;
+    state.totalEnriched += enriched;
+  } else {
+    // More records remain for this brand — stay at same offset
+    // Store progress in state so we can pick up where we left off
+    state.totalEnriched += enriched;
+  }
+
+  state.processed++;
+  const done = fullyDone && state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  await env.MASTER_DB.put("state/sync-fragella-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+
+  return json({
+    done,
+    brandName,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalBrands: allBrands.length,
+    processed: state.processed,
+    totalEnriched: state.totalEnriched,
+    totalNoMatch: state.totalNoMatch,
+    totalSkipped: state.totalSkipped,
+    thisBrand: {
+      fragellaHits: fragellaHits.length,
+      catalogRecords: catalogKeys.length,
+      enriched,
+      noMatch,
+      fullyDone,
+    },
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
+
+
   return (s || "")
     .toLowerCase()
     .replace(/'/g, "")
