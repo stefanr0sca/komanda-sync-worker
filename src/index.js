@@ -125,7 +125,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     console.log("Cron fired:", event.cron);
-    ctx.waitUntil(rebuildFullLoop(env, "cron"));
+    ctx.waitUntil(fragellaFetchLoop(env));
   },
 };
 
@@ -1733,7 +1733,114 @@ async function handleRebuildChunk(request, env) {
   }
 }
 
-async function rebuildFullLoop(env, trigger) {
+// Cron: fetch Fragella brand data in a time-bounded loop.
+// Runs for up to 12 minutes per cron invocation, processing one brand per iteration.
+// State is persisted to R2 so each cron picks up where the last left off.
+async function fragellaFetchLoop(env) {
+  const DEADLINE = Date.now() + 12 * 60 * 1000; // 12 min max
+
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return;
+    allBrands = JSON.parse(await indexObj.text());
+  } catch { return; }
+
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalBrands: allBrands.length,
+    currentOffset: 0,
+    totalFetched: 0,
+    totalNoMatch: 0,
+    totalSkipped: 0,
+  };
+
+  try {
+    const stateObj = await env.MASTER_DB.get("state/sync-fragella-brands.json");
+    if (stateObj) {
+      const saved = JSON.parse(await stateObj.text());
+      if (saved.status === "done") {
+        console.log("Fragella brands fetch already complete");
+        return;
+      }
+      state = saved;
+    }
+  } catch {}
+
+  let processed = 0;
+
+  while (state.currentOffset < allBrands.length && Date.now() < DEADLINE) {
+    const brand = allBrands[state.currentOffset];
+    const brandName = brand.name || "";
+    const brandSlug = slugify(brandName);
+
+    // Skip if already fetched
+    let alreadyFetched = false;
+    try {
+      const existing = await env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
+      if (existing) alreadyFetched = true;
+    } catch {}
+
+    if (alreadyFetched) {
+      state.currentOffset++;
+      state.totalSkipped++;
+    } else {
+      let fragellaHits = [];
+      try {
+        const brandVariants = [
+          brandName,
+          brandName.replace(/^(Parfums?|Maison|House of|The|Les?|By)\s+/i, ""),
+        ].filter((v, i, a) => a.indexOf(v) === i);
+
+        for (const variant of brandVariants) {
+          const url = `${FRAGELLA_BASE}/brands/${encodeURIComponent(variant)}?limit=500`;
+          const res = await fetch(url, { headers: { "x-api-key": env.FRAGELLA_API_KEY } });
+          if (res.ok) {
+            const raw = await res.json();
+            const hits = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+            if (hits.length > 0) { fragellaHits = hits; break; }
+          }
+        }
+      } catch {}
+
+      if (fragellaHits.length > 0) {
+        try {
+          await env.MASTER_DB.put(
+            `fragella-brands/${brandSlug}.json`,
+            JSON.stringify({ brandName, brandSlug, fetchedAt: new Date().toISOString(), count: fragellaHits.length, scents: fragellaHits }),
+            { httpMetadata: { contentType: "application/json" } }
+          );
+          state.totalFetched++;
+        } catch {}
+      } else {
+        state.totalNoMatch++;
+      }
+
+      state.currentOffset++;
+      processed++;
+    }
+
+    // Save state every 50 brands
+    if (processed % 50 === 0) {
+      try {
+        await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+      } catch {}
+    }
+  }
+
+  const done = state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  try {
+    await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+  } catch {}
+
+  console.log(`Fragella fetch cron: processed ${processed} brands, total ${state.totalFetched} fetched, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
+}
+
+
   try {
     await env.MASTER_DB.delete("state/rebuild-staging.json");
     let cursor = null;
