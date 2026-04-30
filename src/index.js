@@ -2003,7 +2003,7 @@ async function handleSyncFragellaAll(request, env) {
   let noMatch = 0;
 
   // Process in batches of 50 to avoid timeout
-  const batch = catalogKeys.slice(0, 50);
+  const batch = catalogKeys.slice(0, 500);
 
   await Promise.all(batch.map(async (key) => {
     try {
@@ -2059,7 +2059,7 @@ async function handleSyncFragellaAll(request, env) {
 
   // Only advance offset if all catalog records for this brand are processed
   // (if brand has >50 scents, we'll come back next call with same offset)
-  const fullyDone = batch.length === catalogKeys.length || batch.length < 50;
+  const fullyDone = batch.length === catalogKeys.length || batch.length < 500;
 
   if (fullyDone) {
     state.currentOffset = offset + 1;
