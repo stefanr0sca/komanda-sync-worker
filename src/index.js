@@ -1840,7 +1840,7 @@ async function fragellaFetchLoop(env) {
   console.log(`Fragella fetch cron: processed ${processed} brands, total ${state.totalFetched} fetched, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
 }
 
-
+async function rebuildFullLoop(env, trigger) {
   try {
     await env.MASTER_DB.delete("state/rebuild-staging.json");
     let cursor = null;
