@@ -11,4 +11,4 @@ subrequests = 10000
 cpu_ms = 300000
 
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["*/30 * * * *"]
