@@ -2098,7 +2098,7 @@ async function handleSyncFragellaAll(request, env) {
   });
 }
 
-
+function slugify(s) {
   return (s || "")
     .toLowerCase()
     .replace(/'/g, "")
