@@ -97,6 +97,10 @@ export default {
       return handleSyncFragellaMerge(request, env);
     }
 
+    if (url.pathname === "/api/sync-images" && request.method === "POST") {
+      return handleSyncImages(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         worker: "komanda-sync-worker",
@@ -2532,6 +2536,177 @@ async function handleSyncFragellaMerge(request, env) {
     totalNoMatch: state.totalNoMatch,
     totalSkipped: state.totalSkipped,
     thisBrand: { catalogRecords: catalogKeys.length, enriched, noMatch, fullyDone },
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// /api/sync-images — Phase 2b-img: mirror images from Fragplace + Fragella to R2.
+//
+// For each brand in the index, reads catalog records and downloads:
+//   - sources/fragplace image → images/fragplace/{scent-id}.jpg
+//   - sources/fragella image  → images/fragella/{scent-id}.jpg
+//
+// Writes to komanda-images R2 bucket (binding: IMAGES_DB).
+// One brand per call — loop until done: true. Skips already-mirrored images.
+// No external API calls beyond image downloads.
+//
+// POST body: { reset?: boolean }
+// ---------------------------------------------------------------------------
+async function handleSyncImages(request, env) {
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+  if (!env.IMAGES_DB) return json({ error: "IMAGES_DB R2 binding not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const reset = body.reset === true;
+
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
+    allBrands = JSON.parse(await indexObj.text());
+  } catch (err) {
+    return json({ error: `Brand index load failed: ${err.message}` }, 500);
+  }
+
+  let state = {
+    startedAt: new Date().toISOString(),
+    status: "running",
+    totalBrands: allBrands.length,
+    currentOffset: 0,
+    totalMirrored: 0,
+    totalSkipped: 0,
+    totalFailed: 0,
+  };
+
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/sync-images.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = state.currentOffset;
+  if (offset >= allBrands.length) {
+    return json({ done: true, totalBrands: allBrands.length, totalMirrored: state.totalMirrored, totalSkipped: state.totalSkipped, note: "Image mirror complete." });
+  }
+
+  const brand = allBrands[offset];
+  const brandName = brand.name || "";
+  const brandSlug = slugify(brandName);
+
+  // List catalog records for this brand
+  let catalogKeys = [];
+  try {
+    let cursor;
+    do {
+      const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+      cursor = listRes.truncated ? listRes.cursor : null;
+    } while (cursor);
+  } catch {}
+
+  if (catalogKeys.length === 0) {
+    state.currentOffset = offset + 1;
+    state.totalSkipped++;
+    const done = state.currentOffset >= allBrands.length;
+    state.status = done ? "done" : "running";
+    if (done) state.finishedAt = new Date().toISOString();
+    await env.MASTER_DB.put("state/sync-images.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+    return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, totalMirrored: state.totalMirrored, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "no catalog records" } });
+  }
+
+  let mirrored = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  // Process up to 20 scents per call to stay within CPU limits
+  const batch = catalogKeys.slice(0, 20);
+
+  await Promise.all(batch.map(async (key) => {
+    try {
+      const obj = await env.MASTER_DB.get(key);
+      if (!obj) return;
+      const record = JSON.parse(await obj.text());
+      const id = record.id;
+      if (!id) return;
+
+      const downloads = [];
+
+      // Fragplace image
+      const fpUrl = record.fragplace?.imageUrl;
+      if (fpUrl) {
+        const fpKey = `fragplace/${id}.webp`;
+        const existing = await env.IMAGES_DB.get(fpKey).catch(() => null);
+        if (!existing) {
+          downloads.push(
+            fetch(fpUrl)
+              .then(async r => {
+                if (r.ok) {
+                  const buf = await r.arrayBuffer();
+                  const ct = r.headers.get("content-type") || "image/webp";
+                  await env.IMAGES_DB.put(fpKey, buf, { httpMetadata: { contentType: ct } });
+                  mirrored++;
+                } else { failed++; }
+              })
+              .catch(() => { failed++; })
+          );
+        } else { skipped++; }
+      }
+
+      // Fragella image
+      const feUrl = record.fragella?.imageUrl;
+      if (feUrl && feUrl !== fpUrl) {
+        const feKey = `fragella/${id}.webp`;
+        const existing = await env.IMAGES_DB.get(feKey).catch(() => null);
+        if (!existing) {
+          downloads.push(
+            fetch(feUrl)
+              .then(async r => {
+                if (r.ok) {
+                  const buf = await r.arrayBuffer();
+                  const ct = r.headers.get("content-type") || "image/webp";
+                  await env.IMAGES_DB.put(feKey, buf, { httpMetadata: { contentType: ct } });
+                  mirrored++;
+                } else { failed++; }
+              })
+              .catch(() => { failed++; })
+          );
+        } else { skipped++; }
+      }
+
+      await Promise.all(downloads);
+    } catch { failed++; }
+  }));
+
+  // Only advance if this was not a full batch (brand has >20 scents — come back)
+  const fullyDone = batch.length >= catalogKeys.length;
+  if (fullyDone) state.currentOffset = offset + 1;
+  state.totalMirrored += mirrored;
+  state.totalSkipped += skipped;
+  state.totalFailed += failed;
+
+  const done = fullyDone && state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  await env.MASTER_DB.put("state/sync-images.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+
+  return json({
+    done,
+    brandName,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalBrands: allBrands.length,
+    totalMirrored: state.totalMirrored,
+    totalSkipped: state.totalSkipped,
+    totalFailed: state.totalFailed,
+    thisBrand: { catalogRecords: catalogKeys.length, batchSize: batch.length, mirrored, skipped, failed, fullyDone },
     finishedAt: done ? state.finishedAt : null,
   });
 }
