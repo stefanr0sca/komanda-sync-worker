@@ -6,6 +6,10 @@ compatibility_date = "2025-01-01"
 binding = "MASTER_DB"
 bucket_name = "komanda-master-db"
 
+[[r2_buckets]]
+binding = "IMAGES_DB"
+bucket_name = "komanda-images"
+
 [limits]
 cpu_ms = 300000
 
