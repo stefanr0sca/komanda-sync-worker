@@ -92,16 +92,23 @@ async function handleStartAll(request, env) {
     return json({ error: `Brand index load failed: ${err.message}` }, 500);
   }
 
-  // Only start workflows for brands that have Fragella data
-  const brandsWithFragella = [];
-  for (const brand of allBrands) {
-    const slug = slugify(brand.name);
-    try {
-      const exists = await env.MASTER_DB.get(`fragella-brands/${slug}.json`);
-      if (exists) brandsWithFragella.push(brand);
-    } catch {}
+  // List fragella-brands/ keys — one fast list operation instead of 6006 individual reads
+  const fragellaKeys = new Set();
+  try {
+    let cursor;
+    do {
+      const listRes = await env.MASTER_DB.list({ prefix: "fragella-brands/", limit: 1000, cursor });
+      for (const obj of listRes.objects) {
+        const slug = obj.key.replace("fragella-brands/", "").replace(".json", "");
+        fragellaKeys.add(slug);
+      }
+      cursor = listRes.truncated ? listRes.cursor : null;
+    } while (cursor);
+  } catch (err) {
+    return json({ error: `Fragella brands list failed: ${err.message}` }, 500);
   }
 
+  const brandsWithFragella = allBrands.filter(b => fragellaKeys.has(slugify(b.name)));
   const batch = brandsWithFragella.slice(0, batchSize);
   const started = [];
 
@@ -109,32 +116,21 @@ async function handleStartAll(request, env) {
     const slug = slugify(brand.name);
     const instanceId = `brand-${slug}`;
     try {
-      // Check if already running
-      const existing = await env.CATALOG_WORKFLOW.get(instanceId).catch(() => null);
-      if (existing) {
-        const status = await existing.status();
-        if (status.status === "running" || status.status === "queued") {
-          started.push({ brandName: brand.name, instanceId, status: "already-running" });
-          continue;
-        }
-      }
-    } catch {}
-
-    try {
       const instance = await env.CATALOG_WORKFLOW.create({
         id: instanceId,
         params: { brandName: brand.name, brandSlug: slug },
       });
       started.push({ brandName: brand.name, instanceId: instance.id, status: "started" });
     } catch (err) {
-      started.push({ brandName: brand.name, instanceId, status: "error", error: err.message });
+      started.push({ brandName: brand.name, instanceId, status: "skipped", error: err.message });
     }
   }
 
   return json({
     totalBrandsWithFragella: brandsWithFragella.length,
     batchSize,
-    started: started.length,
+    started: started.filter(s => s.status === "started").length,
+    skipped: started.filter(s => s.status === "skipped").length,
     results: started,
   });
 }
