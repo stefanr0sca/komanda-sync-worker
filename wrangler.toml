@@ -1,6 +1,6 @@
-name = "komanda-sync-worker"
+name = "fragrances-catalog-worker"
 main = "src/index.js"
-compatibility_date = "2025-01-01"
+compatibility_date = "2025-05-05"
 
 [[r2_buckets]]
 binding = "MASTER_DB"
@@ -8,7 +8,12 @@ bucket_name = "komanda-master-db"
 
 [[r2_buckets]]
 binding = "IMAGES_DB"
-bucket_name = "komanda-images"
+bucket_name = "fragrances-images"
+
+[[workflows]]
+name = "fragrances-catalog-workflow"
+binding = "CATALOG_WORKFLOW"
+class_name = "CatalogWorkflow"
 
 [limits]
 cpu_ms = 300000
