@@ -112,7 +112,8 @@ async function handleStartAll(request, env) {
   const batch = brandsWithFragella.slice(0, batchSize);
   const started = [];
 
-  for (const brand of batch) {
+  // Create all instances in parallel
+  const results = await Promise.all(batch.map(async (brand) => {
     const slug = slugify(brand.name);
     const instanceId = `brand-${slug}`;
     try {
@@ -120,11 +121,12 @@ async function handleStartAll(request, env) {
         id: instanceId,
         params: { brandName: brand.name, brandSlug: slug },
       });
-      started.push({ brandName: brand.name, instanceId: instance.id, status: "started" });
+      return { brandName: brand.name, instanceId: instance.id, status: "started" };
     } catch (err) {
-      started.push({ brandName: brand.name, instanceId, status: "skipped", error: err.message });
+      return { brandName: brand.name, instanceId, status: "skipped", error: err.message };
     }
-  }
+  }));
+  const started = results;
 
   return json({
     totalBrandsWithFragella: brandsWithFragella.length,
