@@ -9,6 +9,8 @@
 //   POST /api/workflow/pause?id=<id>    → pause a running instance
 //   GET  /api/brands/progress           → summary of fragella-brands fetch progress
 
+import { WorkflowEntrypoint } from 'cloudflare:workers';
+
 const FRAGELLA_BASE = "https://api.fragella.com/api/v1";
 
 const corsHeaders = {
