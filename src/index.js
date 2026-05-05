@@ -123,7 +123,7 @@ async function handleStatus(url, env) {
 // ---------------------------------------------------------------------------
 export class CatalogWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
-    const { brandName, brandSlug } = event.params;
+    const { brandName, brandSlug } = event.payload;
 
     // Step 1: Merge Fragella data into catalog records
     const mergeResult = await step.do(`merge-${brandSlug}`, async () => {
