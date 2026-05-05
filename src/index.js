@@ -1,34 +1,15 @@
 // src/index.js
-// Fragplace catalog → R2 sync worker
+// Fragrances Catalog Worker + Workflow
+//
 // Endpoints:
-//   GET  /                      -> health + endpoint list
-//   GET  /api/status            -> R2 listing summary + last rebuild state
-//   POST /api/sync-brands       -> fetch & write a brand batch to R2
-//   POST /api/rebuild-index     -> process ONE chunk of rebuild, return continuation
-//   POST /api/probe-fragplace   -> read-only Fragplace schema/EAN probe
-//   POST /api/probe-fragella    -> read-only Fragella search probe by scent name
+//   GET  /                              → health + status
+//   POST /api/workflow/start            → start full catalog pipeline for all brands
+//   POST /api/workflow/start-brand      → start pipeline for one brand
+//   GET  /api/workflow/status?id=<id>   → get workflow instance status
+//   POST /api/workflow/pause?id=<id>    → pause a running instance
+//   GET  /api/brands/progress           → summary of fragella-brands fetch progress
 
-const FRAGPLACE_URL = "https://fragrance-api.p.rapidapi.com/multi-search";
-const RAPIDAPI_HOST = "fragrance-api.p.rapidapi.com";
 const FRAGELLA_BASE = "https://api.fragella.com/api/v1";
-
-const REBUILD_CHUNK_SIZE = 200;
-
-// Brand family keywords — used to filter fuzzy Fragella search results
-const BRAND_FAMILIES = {
-  "Lattafa":         ["lattafa", "asdaaf", "rave"],
-  "Armaf":           ["armaf", "sterling"],
-  "Paris Corner":    ["paris corner", "emir", "pendora"],
-  "Zimaya":          ["zimaya"],
-  "Fragrance World": ["fragrance world", "french avenue"],
-  "Alhambra":        ["alhambra"],
-  "Khadlaj":         ["khadlaj"],
-  "Mancera":         ["mancera"],
-  "Montale":         ["montale"],
-  "Tom Ford":        ["tom ford"],
-  "Dior":            ["dior", "christian dior"],
-  "Chanel":          ["chanel"],
-};
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -37,6 +18,9 @@ const corsHeaders = {
   "Content-Type": "application/json",
 };
 
+// ---------------------------------------------------------------------------
+// Main fetch handler — HTTP API
+// ---------------------------------------------------------------------------
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -45,1016 +29,178 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/sync-brands" && request.method === "POST") {
-      return handleSyncBrands(request, env);
-    }
-
-    if (url.pathname === "/api/status" && request.method === "GET") {
-      return handleStatus(env);
-    }
-
-    if (url.pathname === "/api/rebuild-index" && request.method === "POST") {
-      return handleRebuildChunk(request, env);
-    }
-
-    if (url.pathname === "/api/probe-fragplace" && request.method === "POST") {
-      return handleProbeFragplace(request, env);
-    }
-
-    if (url.pathname === "/api/probe-fragella" && request.method === "POST") {
-      return handleProbeFragella(request, env);
-    }
-
-    if (url.pathname === "/api/sync-fragplace-all" && request.method === "POST") {
-      return handleSyncFragplaceAll(request, env);
-    }
-
-    if (url.pathname === "/api/sync-brand-stubs" && request.method === "POST") {
-      return handleSyncBrandStubs(request, env);
-    }
-
-    if (url.pathname === "/api/sync-brands-full" && request.method === "POST") {
-      return handleSyncBrandsFull(request, env);
-    }
-
-    if (url.pathname === "/api/sync-fragella-brands" && request.method === "POST") {
-      return handleSyncFragellaBrands(request, env);
-    }
-
-    if (url.pathname === "/api/sync-fragella-merge" && request.method === "POST") {
-      return handleSyncFragellaMerge(request, env);
-    }
-
-    if (url.pathname === "/api/sync-images" && request.method === "POST") {
-      return handleSyncImages(request, env);
-    }
-
+    // Health / status
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
-        worker: "komanda-sync-worker",
+        worker: "fragrances-catalog-worker",
         status: "ok",
         endpoints: [
-          "GET  /api/status",
-          "POST /api/sync-brands",
-          "POST /api/rebuild-index     (processes one chunk; loop until done: true)",
-          "POST /api/probe-fragplace   (read-only schema/EAN probe; brandName optional)",
-          "POST /api/probe-fragella    (read-only scent search; scentName required, brandName optional)",
-          "POST /api/sync-products     (enrich + merge scents for one brand; writes to R2)",
-          "POST /api/sync-all-brands   (processes one brand per call; loop until done: true)",
-          "POST /api/sync-fragplace-all (Phase 1: full Fragplace scent sync by brand ID; no enrichment)",
-          "POST /api/sync-brand-stubs   (write catalog-brands stubs for brands with 0 Fragplace scents)",
-          "POST /api/sync-brands-full   (discover all brands via A-Z/0-9/year queries; one query per call)",
-          "POST /api/sync-fragella-all  (Phase 2: Fragella enrichment via brand endpoint; one brand per call)",
-          "POST /api/sync-fragella-brands (Phase 2a: fetch Fragella brand data; no catalog writes; fast)",
-          "POST /api/sync-fragella-merge  (Phase 2b: merge Fragella data into catalog; no API calls)",
+          "POST /api/workflow/start           — start full pipeline (all brands)",
+          "POST /api/workflow/start-brand     — start pipeline for one brand {brandSlug}",
+          "GET  /api/workflow/status?id=<id>  — get workflow instance status",
+          "GET  /api/brands/progress          — fragella fetch progress summary",
         ],
-        cron: "Rebuild runs automatically every 6 hours.",
       });
+    }
+
+    // Start workflow for ALL brands
+    if (url.pathname === "/api/workflow/start" && request.method === "POST") {
+      return handleStartAll(request, env);
+    }
+
+    // Start workflow for ONE brand
+    if (url.pathname === "/api/workflow/start-brand" && request.method === "POST") {
+      return handleStartBrand(request, env);
+    }
+
+    // Get workflow instance status
+    if (url.pathname === "/api/workflow/status" && request.method === "GET") {
+      return handleStatus(url, env);
+    }
+
+    // Progress summary
+    if (url.pathname === "/api/brands/progress" && request.method === "GET") {
+      return handleProgress(env);
     }
 
     return json({ error: "Not found" }, 404);
   },
 
+  // Cron: trigger workflow for any brands not yet processed
   async scheduled(event, env, ctx) {
     console.log("Cron fired:", event.cron);
-    ctx.waitUntil(fragellaFetchLoop(env));
+    ctx.waitUntil(cronTrigger(env));
   },
 };
 
-
 // ---------------------------------------------------------------------------
-// /api/sync-brands-full — full brand discovery via exhaustive query strategy.
-//
-// Fragplace caps unfiltered brand queries at 1000. To discover all brands,
-// we query with multiple search terms that each return different windows:
-//   - Letters a-z
-//   - Digits 0-9
-//   - Years 1920-2024
-//
-// Each query returns up to 1000 brands. Results are deduplicated by brand ID.
-// Only NEW brands (not already in R2) are written. Progress is saved to R2.
-// One query per call — tester loops until done: true.
-//
-// POST body: {
-//   reset?: boolean   // restart from first query
-// }
+// Start workflow for ALL brands — creates one instance per brand
 // ---------------------------------------------------------------------------
-async function handleSyncBrandsFull(request, env) {
-  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
+async function handleStartAll(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
-  const reset = body.reset === true;
+  const { batchSize = 50, reset = false } = body;
 
-  // Build the full query list
-  const queries = [];
-  // Letters a-z
-  for (let i = 0; i < 26; i++) queries.push(String.fromCharCode(97 + i));
-  // Digits 0-9
-  for (let i = 0; i <= 9; i++) queries.push(String(i));
-  // Years 1920-2024
-  for (let y = 1920; y <= 2024; y++) queries.push(String(y));
-  // Total: ~141 queries
-
-  // Load or reset state
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalQueries: queries.length,
-    currentOffset: 0,
-    totalFound: 0,
-    totalNew: 0,
-    totalSkipped: 0,
-    seenIds: [],
-  };
-
-  if (!reset) {
-    try {
-      const stateObj = await env.MASTER_DB.get("state/sync-brands-full.json");
-      if (stateObj) {
-        const saved = JSON.parse(await stateObj.text());
-        if (saved.status !== "done") state = saved;
-      }
-    } catch {}
-  }
-
-  const offset = state.currentOffset;
-
-  if (offset >= queries.length) {
-    return json({
-      done: true,
-      totalQueries: queries.length,
-      totalFound: state.totalFound,
-      totalNew: state.totalNew,
-      note: "All brand discovery queries complete.",
-    });
-  }
-
-  const q = queries[offset];
-  const seenIds = new Set(state.seenIds || []);
-
-  // Fetch brands for this query term
-  let hits = [];
-  try {
-    const res = await fetch(FRAGPLACE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": env.RAPIDAPI_KEY,
-      },
-      body: JSON.stringify({
-        queries: [{ indexUid: "brands", q, limit: 1000, offset: 0 }],
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      hits = data?.results?.[0]?.hits || [];
-    }
-  } catch (_) {}
-
-  // Deduplicate: only process brands we haven't seen yet
-  const newBrands = hits.filter(b => !seenIds.has(b.id));
-
-  // Write new brands to R2
-  let written = 0;
-  if (newBrands.length > 0) {
-    const writes = newBrands.map(b => {
-      seenIds.add(b.id);
-      const record = {
-        id: b.id,
-        name: b.name || "",
-        slug: slugify(b.name),
-        popularityScore: b.popularityScore ?? null,
-        description: b.description || "",
-        logoUrl: b.image?.url || "",
-        status: b.status || "",
-        syncedAt: new Date().toISOString(),
-        raw: b,
-      };
-      return env.MASTER_DB.put(
-        `brands/${b.id}.json`,
-        JSON.stringify(record),
-        { httpMetadata: { contentType: "application/json" } }
-      );
-    });
-    await Promise.all(writes);
-    written = newBrands.length;
-  }
-
-  // Update state
-  state.currentOffset = offset + 1;
-  state.totalFound += hits.length;
-  state.totalNew += written;
-  state.totalSkipped += (hits.length - written);
-  state.seenIds = Array.from(seenIds);
-
-  const done = state.currentOffset >= queries.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  await env.MASTER_DB.put(
-    "state/sync-brands-full.json",
-    JSON.stringify(state),
-    { httpMetadata: { contentType: "application/json" } }
-  );
-
-  return json({
-    done,
-    query: q,
-    offset,
-    nextOffset: done ? null : state.currentOffset,
-    totalQueries: queries.length,
-    hitsThisQuery: hits.length,
-    newThisQuery: written,
-    totalFound: state.totalFound,
-    totalNew: state.totalNew,
-    uniqueBrandsSoFar: seenIds.size,
-    finishedAt: done ? state.finishedAt : null,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// /api/sync-brand-stubs — write catalog-brands stubs for brands that
-// returned 0 scents in Phase 1 (not in Fragplace's scent index).
-//
-// Reads state/sync-fragplace-all.json to find skipped brands,
-// writes a minimal stub to catalog-brands/{brand-slug}.json for each.
-// Single call — no looping needed, only ~72 brands.
-//
-// POST body: {} (no parameters needed)
-// ---------------------------------------------------------------------------
-async function handleSyncBrandStubs(request, env) {
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
-  // Load Phase 1 state to find skipped brands
-  let skippedBrands = [];
-  try {
-    const stateObj = await env.MASTER_DB.get("state/sync-fragplace-all.json");
-    if (!stateObj) return json({ error: "state/sync-fragplace-all.json not found — run Phase 1 first" }, 500);
-    const state = JSON.parse(await stateObj.text());
-    skippedBrands = (state.brandResults || []).filter(b => b.scentsFound === 0);
-  } catch (err) {
-    return json({ error: `State load failed: ${err.message}` }, 500);
-  }
-
-  if (skippedBrands.length === 0) {
-    return json({ note: "No skipped brands found in Phase 1 state.", written: 0 });
-  }
-
-  // Also load the full brand index to get popularityScore + logoUrl
-  let brandIndex = [];
-  try {
-    const indexObj = await env.MASTER_DB.get("brands/index.json");
-    if (indexObj) brandIndex = JSON.parse(await indexObj.text());
-  } catch (_) {}
-
-  const brandIndexById = {};
-  for (const b of brandIndex) brandIndexById[b.id] = b;
-
-  const syncedAt = new Date().toISOString();
-  let written = 0;
-  const results = [];
-
-  await Promise.all(skippedBrands.map(async (b) => {
-    const brandMeta = brandIndexById[b.brandId] || {};
-    const stub = {
-      brandId: b.brandId,
-      name: b.brand,
-      slug: slugify(b.brand),
-      popularityScore: brandMeta.popularityScore ?? null,
-      logoUrl: brandMeta.logoUrl || null,
-      source: "fragplace-brands-index",
-      fragplaceScents: 0,
-      syncedAt,
-      note: "Brand exists in Fragplace brand index but has no scents in the fragrances index.",
-    };
-
-    try {
-      await env.MASTER_DB.put(
-        `catalog-brands/${stub.slug}.json`,
-        JSON.stringify(stub),
-        { httpMetadata: { contentType: "application/json" } }
-      );
-      written++;
-      results.push({ brand: b.brand, slug: stub.slug, written: true });
-    } catch (err) {
-      results.push({ brand: b.brand, slug: stub.slug, error: err.message });
-    }
-  }));
-
-  return json({
-    written,
-    total: skippedBrands.length,
-    results,
-    syncedAt,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// /api/sync-fragplace-all — Phase 1: full Fragplace scent sync.
-//
-// Loops through ALL brands in the Fragplace brands index (R2),
-// queries each by brand.id, writes raw scent records and minimal
-// catalog stubs. No Fragella, no Vivantis — pure speed.
-//
-// One brand per call. Tester loops until done: true.
-// Progress persisted in R2 — safe to resume.
-//
-// POST body: {
-//   offset?: number,      // brand index offset (default: resume from state)
-//   reset?: boolean,      // restart from brand 0
-//   limit?: number        // max scents per brand (default 1000 = all)
-// }
-// ---------------------------------------------------------------------------
-async function handleSyncFragplaceAll(request, env) {
-  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-
-  const reset = body.reset === true;
-  const scentLimit = body.limit || 1000;
-  const skipExisting = body.skipExisting !== false; // default true
-
-  // Load Fragplace brands index from R2
   let allBrands = [];
   try {
     const indexObj = await env.MASTER_DB.get("brands/index.json");
-    if (!indexObj) return json({ error: "brands/index.json not found — run sync-brands first" }, 500);
+    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
     allBrands = JSON.parse(await indexObj.text());
   } catch (err) {
     return json({ error: `Brand index load failed: ${err.message}` }, 500);
   }
 
-  // Load or reset state
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalBrands: allBrands.length,
-    currentOffset: 0,
-    processed: 0,
-    totalScentsWritten: 0,
-    totalSkipped: 0,
-    totalErrors: 0,
-    brandResults: [],
-  };
-
-  if (!reset) {
+  // Only start workflows for brands that have Fragella data
+  const brandsWithFragella = [];
+  for (const brand of allBrands) {
+    const slug = slugify(brand.name);
     try {
-      const stateObj = await env.MASTER_DB.get("state/sync-fragplace-all.json");
-      if (stateObj) {
-        const saved = JSON.parse(await stateObj.text());
-        if (saved.status !== "done") state = saved;
-      }
+      const exists = await env.MASTER_DB.get(`fragella-brands/${slug}.json`);
+      if (exists) brandsWithFragella.push(brand);
     } catch {}
   }
 
-  const offset = typeof body.offset === "number" ? body.offset : state.currentOffset;
+  const batch = brandsWithFragella.slice(0, batchSize);
+  const started = [];
 
-  if (offset >= allBrands.length) {
-    return json({
-      done: true,
-      totalBrands: allBrands.length,
-      processed: state.processed,
-      totalScentsWritten: state.totalScentsWritten,
-      totalSkipped: state.totalSkipped,
-      totalErrors: state.totalErrors,
-      note: "All Fragplace brands processed.",
-    });
-  }
-
-  const brand = allBrands[offset];
-  const brandId = brand.id;
-  const brandName = brand.name || "";
-  const brandSlug = slugify(brandName);
-
-  // Skip if brand already has catalog entries (skipExisting mode)
-  if (skipExisting) {
+  for (const brand of batch) {
+    const slug = slugify(brand.name);
+    const instanceId = `brand-${slug}`;
     try {
-      const existing = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1 });
-      if (existing.objects.length > 0) {
-        state.currentOffset = offset + 1;
-        state.processed++;
-        state.totalSkipped++;
-        state.brandResults.push({ brand: brandName, brandId, scentsFound: 0, written: 0, skipped: true });
-        const done = state.currentOffset >= allBrands.length;
-        state.status = done ? "done" : "running";
-        if (done) state.finishedAt = new Date().toISOString();
-        await env.MASTER_DB.put("state/sync-fragplace-all.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-        return json({ done, brandName, brandId, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, processed: state.processed, totalScentsWritten: state.totalScentsWritten, totalSkipped: state.totalSkipped, totalErrors: state.totalErrors, thisBrand: { skipped: true, reason: "already exists" }, finishedAt: done ? state.finishedAt : null });
+      // Check if already running
+      const existing = await env.CATALOG_WORKFLOW.get(instanceId).catch(() => null);
+      if (existing) {
+        const status = await existing.status();
+        if (status.status === "running" || status.status === "queued") {
+          started.push({ brandName: brand.name, instanceId, status: "already-running" });
+          continue;
+        }
       }
-    } catch (_) {}
-  }
+    } catch {}
 
-  // Fetch scents for this brand by ID
-  let scentsWritten = 0;
-  let scentsFound = 0;
-  let errors = 0;
-
-  try {
-    const fpRes = await fetch(FRAGPLACE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": env.RAPIDAPI_KEY,
-      },
-      body: JSON.stringify({
-        queries: [{
-          indexUid: "fragrances",
-          q: "",
-          filter: [`brand.id = ${brandId}`],
-          limit: scentLimit,
-          offset: 0,
-        }],
-      }),
-    });
-
-    if (fpRes.ok) {
-      const fpData = await fpRes.json();
-      const hits = fpData?.results?.[0]?.hits || [];
-      scentsFound = hits.length;
-
-      const writes = hits.map(scent => {
-        const scentSlug = slugify(scent.name || "");
-        const catalogRecord = {
-          id: scent.id,
-          slug: scentSlug,
-          brandSlug,
-          brand: brandName,
-          brandId,
-          name: scent.name || "",
-          eans: [],           // populated during SKU attachment pass
-          syncedAt: new Date().toISOString(),
-          fragplace: {
-            id: scent.id,
-            popularityScore: scent.popularityScore ?? null,
-            reviewsScoreAvg: scent.reviewsScoreAvg ?? null,
-            reviewsCount: scent.reviewsCount ?? null,
-            releasedAt: scent.releasedAt ?? null,
-            status: scent.status ?? null,
-            notes: scent.notes || [],
-            perfumers: scent.perfumers || [],
-            imageUrl: scent.image?.url || null,
-          },
-          fragella: null,     // populated during Fragella enrichment pass
-          variants: [],       // populated during SKU attachment pass
-          variantCount: 0,
-          hasSupplierData: false,
-        };
-
-        return Promise.all([
-          // Raw Fragplace source
-          env.MASTER_DB.put(
-            `sources/fragplace/${scent.id}.json`,
-            JSON.stringify(scent),
-            { httpMetadata: { contentType: "application/json" } }
-          ),
-          // Catalog stub
-          env.MASTER_DB.put(
-            `catalog/${brandSlug}/${scent.id}.json`,
-            JSON.stringify(catalogRecord),
-            { httpMetadata: { contentType: "application/json" } }
-          ),
-        ]);
+    try {
+      const instance = await env.CATALOG_WORKFLOW.create({
+        id: instanceId,
+        params: { brandName: brand.name, brandSlug: slug },
       });
-
-      await Promise.all(writes);
-      scentsWritten = hits.length;
+      started.push({ brandName: brand.name, instanceId: instance.id, status: "started" });
+    } catch (err) {
+      started.push({ brandName: brand.name, instanceId, status: "error", error: err.message });
     }
-  } catch (err) {
-    errors++;
   }
-
-  // Update state
-  state.currentOffset = offset + 1;
-  state.processed++;
-  state.totalScentsWritten += scentsWritten;
-  state.totalErrors += errors;
-  if (scentsFound === 0) state.totalSkipped++;
-
-  state.brandResults.push({
-    brand: brandName,
-    brandId,
-    scentsFound,
-    written: scentsWritten,
-    errors,
-  });
-
-  const done = state.currentOffset >= allBrands.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  await env.MASTER_DB.put(
-    "state/sync-fragplace-all.json",
-    JSON.stringify(state),
-    { httpMetadata: { contentType: "application/json" } }
-  );
 
   return json({
-    done,
-    brandName,
-    brandId,
-    offset,
-    nextOffset: done ? null : state.currentOffset,
-    totalBrands: allBrands.length,
-    processed: state.processed,
-    totalScentsWritten: state.totalScentsWritten,
-    totalSkipped: state.totalSkipped,
-    totalErrors: state.totalErrors,
-    thisBrand: { scentsFound, written: scentsWritten, errors },
-    finishedAt: done ? state.finishedAt : null,
+    totalBrandsWithFragella: brandsWithFragella.length,
+    batchSize,
+    started: started.length,
+    results: started,
   });
 }
 
-function parseCSV(text, delimiter = ";") {
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  if (lines.length < 2) return [];
-  const headers = splitCSVLine(lines[0], delimiter);
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const values = splitCSVLine(lines[i], delimiter);
-    if (values.length === 0) continue;
-    const row = {};
-    headers.forEach((h, idx) => { row[h] = values[idx] || ""; });
-    rows.push(row);
-  }
-  return rows;
-}
-
-function splitCSVLine(line, delimiter) {
-  const result = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (ch === delimiter && !inQuotes) {
-      result.push(current.trim());
-      current = "";
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current.trim());
-  return result;
-}
-
 // ---------------------------------------------------------------------------
-// /api/probe-fragella — read-only Fragella search probe.
-//
-// Searches Fragella by scent name (normalized), optionally filters results
-// by brand family to remove fuzzy-match noise. Returns best match candidate,
-// all raw hits, and field schema seen.
-//
-// POST body: {
-//   scentName: string,    // required — e.g. "Raed Oud" or "Ra`ed Oud"
-//   brandName?: string,   // optional — e.g. "Lattafa" (used for family filter)
-//   limit?: number        // default 5
-// }
+// Start workflow for ONE brand
 // ---------------------------------------------------------------------------
-async function handleProbeFragella(request, env) {
-  if (!env.FRAGELLA_API_KEY) {
-    return json({
-      error: "FRAGELLA_API_KEY not configured",
-      hint: "Add it in Cloudflare Dashboard → Workers → komanda-sync-worker → Settings → Variables",
-    }, 500);
-  }
-
+async function handleStartBrand(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
+  const { brandName, brandSlug } = body;
 
-  const scentName = (body.scentName || "").trim();
-  const brandName = (body.brandName || "").trim();
-  const limit = body.limit || 5;
-
-  if (!scentName) {
-    return json({ error: "scentName is required" }, 400);
+  if (!brandName && !brandSlug) {
+    return json({ error: "brandName or brandSlug required" }, 400);
   }
 
-  // Normalize: strip backticks/apostrophes (Arabic ain transliteration),
-  // collapse whitespace, lowercase. Applied to both query and result matching.
-  function normalize(str) {
-    return (str || "")
-      .toLowerCase()
-      .replace(/[`''']/g, "")
-      .replace(/&/g, "and")
-      .replace(/[^\w\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  // Include brand name in search query for precision — "Lattafa Yara" beats "Yara" alone
-  const searchQuery = brandName
-    ? normalize(brandName + " " + scentName)
-    : normalize(scentName);
+  const slug = brandSlug || slugify(brandName);
+  const name = brandName || slug;
+  const instanceId = `brand-${slug}`;
 
   try {
-    const url = `${FRAGELLA_BASE}/fragrances?search=${encodeURIComponent(searchQuery)}&limit=${limit}`;
-    const res = await fetch(url, {
-      headers: { "x-api-key": env.FRAGELLA_API_KEY },
+    const instance = await env.CATALOG_WORKFLOW.create({
+      id: instanceId,
+      params: { brandName: name, brandSlug: slug },
     });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      return json({
-        error: `Fragella error ${res.status}`,
-        detail: errText.slice(0, 500),
-        searchQuery,
-      }, res.status);
-    }
-
-    const raw = await res.json();
-    const hits = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
-
-    // Filter by brand family if brandName provided
-    const families = brandName
-      ? (BRAND_FAMILIES[brandName] || [brandName.toLowerCase()])
-      : null;
-
-    const filtered = families
-      ? hits.filter(h => {
-          const b = (h.Brand || h.brand || "").toLowerCase();
-          return families.some(fam => b.includes(fam));
-        })
-      : hits;
-
-    // Best match: exact normalized name → partial → first result
-    // Match against full "brand scent" string when brandName provided, scent alone otherwise
-    const normScent = normalize(scentName);
-    const normFull = brandName ? normalize(brandName + " " + scentName) : normScent;
-    const bestMatch =
-      filtered.find(h => normalize(h.Name || h.name) === normFull) ||
-      filtered.find(h => normalize(h.Name || h.name) === normScent) ||
-      filtered.find(h => normalize(h.Name || h.name).includes(normScent)) ||
-      filtered[0] ||
-      null;
-
-    // Collect all field names seen across hits
-    const fieldsSeen = new Set();
-    for (const h of hits) Object.keys(h).forEach(k => fieldsSeen.add(k));
-
-    const matchedNorm = bestMatch ? normalize(bestMatch.Name || bestMatch.name) : null;
-    return json({
-      scentName,
-      brandName: brandName || null,
-      searchQuery,
-      totalHits: hits.length,
-      filteredHits: filtered.length,
-      exactMatch: matchedNorm === normFull || matchedNorm === normScent,
-      bestMatch,
-      allFilteredHits: filtered,
-      fieldsSeen: Array.from(fieldsSeen).sort(),
-      urlUsed: url,
-    });
-  } catch (err) {
-    return json({ error: err.message, searchQuery }, 500);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// /api/probe-fragplace — read-only Fragplace schema/EAN probe.
-// ---------------------------------------------------------------------------
-async function handleProbeFragplace(request, env) {
-  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const rawBrandName = typeof body.brandName === "string" ? body.brandName.trim() : "";
-  const rawBrandId = typeof body.brandId === "number" ? body.brandId : null;
-  const limit = body.limit || 100;
-
-  const query = {
-    indexUid: "fragrances",
-    q: "",
-    limit,
-    offset: 0,
-  };
-  if (rawBrandId !== null) {
-    query.filter = [`brand.id = ${rawBrandId}`];
-  } else if (rawBrandName) {
-    query.filter = [`brand.name = "${rawBrandName}"`];
-  }
-
-  try {
-    const res = await fetch(FRAGPLACE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": env.RAPIDAPI_KEY,
-      },
-      body: JSON.stringify({ queries: [query] }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      return json({
-        error: `Fragplace error ${res.status}`,
-        detail: errText.slice(0, 500),
-        queryUsed: query,
-      }, res.status);
-    }
-
-    const data = await res.json();
-    const firstResult = data?.results?.[0] || {};
-    const hits = firstResult.hits || [];
-    const estimatedTotal = firstResult.estimatedTotalHits ?? hits.length;
-
-    let withEAN = 0, withBarcode = 0, withUPC = 0;
-    const eanValues = [];
-    const fieldNamesSeen = new Set();
-
-    for (const h of hits) {
-      for (const k of Object.keys(h)) fieldNamesSeen.add(k);
-      const ean = h.ean || h.EAN || h.Ean;
-      const barcode = h.barcode || h.Barcode;
-      const upc = h.upc || h.UPC || h.Upc;
-      if (ean) { withEAN++; eanValues.push({ id: h.id, name: h.name, ean }); }
-      if (barcode) withBarcode++;
-      if (upc) withUPC++;
-    }
-
-    return json({
-      brandName: rawBrandName || null,
-      filterApplied: Boolean(rawBrandName),
-      sampled: hits.length,
-      estimatedTotalForBrand: estimatedTotal,
-      coverage: {
-        withEAN,
-        withBarcode,
-        withUPC,
-        percentEAN: hits.length ? Math.round((withEAN / hits.length) * 100) : 0,
-        percentBarcode: hits.length ? Math.round((withBarcode / hits.length) * 100) : 0,
-        percentUPC: hits.length ? Math.round((withUPC / hits.length) * 100) : 0,
-      },
-      topLevelFieldsSeen: Array.from(fieldNamesSeen).sort(),
-      firstSampleRaw: hits[0] || null,
-      eanSamples: eanValues.slice(0, 10),
-      queryUsed: query,
-    });
-  } catch (err) {
-    return json({ error: err.message, queryUsed: query }, 500);
-  }
-}
-
-async function handleSyncBrands(request, env) {
-  if (!env.RAPIDAPI_KEY) return json({ error: "RAPIDAPI_KEY not configured" }, 500);
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const { offset = 0, limit = 500, dryRun = false } = body;
-
-  try {
-    const res = await fetch(FRAGPLACE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": env.RAPIDAPI_KEY,
-      },
-      body: JSON.stringify({
-        queries: [{ indexUid: "brands", q: "", limit, offset }],
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      return json({ error: `Fragplace error ${res.status}`, detail: errText.slice(0, 300) }, res.status);
-    }
-
-    const data = await res.json();
-    const hits = data?.results?.[0]?.hits || [];
-    const estimatedTotal = data?.results?.[0]?.estimatedTotalHits ?? hits.length;
-
-    if (dryRun) {
-      return json({ dryRun: true, received: hits.length, estimatedTotal, sample: hits.slice(0, 3) });
-    }
-
-    const normalizedRecords = hits.map((b) => ({
-      id: b.id,
-      name: b.name || "",
-      slug: slugify(b.name),
-      popularityScore: b.popularityScore ?? null,
-      description: b.description || "",
-      logoUrl: b.image?.url || "",
-      status: b.status || "",
-      syncedAt: new Date().toISOString(),
-      raw: b,
-    }));
-
-    const writePromises = normalizedRecords.map((n) =>
-      env.MASTER_DB.put(`brands/${n.id}.json`, JSON.stringify(n), {
-        httpMetadata: { contentType: "application/json" },
-      })
-    );
-    await Promise.all(writePromises);
-
-    const hasMore = hits.length === limit;
-    const manifest = {
-      syncedAt: new Date().toISOString(),
-      type: "brands",
-      offset,
-      limit,
-      writtenThisRun: normalizedRecords.length,
-      estimatedTotal,
-      hasMore,
-      nextOffset: offset + hits.length,
-      note: "Index is derived — run POST /api/rebuild-index (loops until done:true).",
-    };
-
-    await env.MASTER_DB.put(
-      `manifest/brands/${Date.now()}.json`,
-      JSON.stringify(manifest),
-      { httpMetadata: { contentType: "application/json" } }
-    );
-
-    return json({ success: true, ...manifest });
+    return json({ instanceId: instance.id, status: "started", brandName: name });
   } catch (err) {
     return json({ error: err.message }, 500);
   }
 }
 
-async function handleStatus(env) {
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+// ---------------------------------------------------------------------------
+// Get workflow instance status
+// ---------------------------------------------------------------------------
+async function handleStatus(url, env) {
+  const id = url.searchParams.get("id");
+  if (!id) return json({ error: "id query parameter required" }, 400);
 
   try {
-    const brandKeys = await listAllKeys(env, "brands/");
-    const brandFileKeys = brandKeys.filter((k) => k !== "brands/index.json");
-
-    let indexLength = null;
-    try {
-      const existing = await env.MASTER_DB.get("brands/index.json");
-      if (existing) {
-        const parsed = JSON.parse(await existing.text());
-        indexLength = Array.isArray(parsed) ? parsed.length : null;
-      }
-    } catch {}
-
-    const manifestKeys = await listAllKeys(env, "manifest/brands/");
-
-    let rebuildState = null;
-    try {
-      const stateObj = await env.MASTER_DB.get("state/rebuild.json");
-      if (stateObj) rebuildState = JSON.parse(await stateObj.text());
-    } catch {}
-
-    return json({
-      brands: {
-        fileCount: brandFileKeys.length,
-        indexLength,
-        drift: indexLength === null ? "no index yet" : brandFileKeys.length - indexLength,
-        firstKey: brandFileKeys[0] ?? null,
-        lastKey: brandFileKeys[brandFileKeys.length - 1] ?? null,
-      },
-      manifests: {
-        count: manifestKeys.length,
-        latest: manifestKeys[manifestKeys.length - 1] ?? null,
-      },
-      rebuild: rebuildState,
-    });
+    const instance = await env.CATALOG_WORKFLOW.get(id);
+    const status = await instance.status();
+    return json({ id, ...status });
   } catch (err) {
-    return json({ error: err.message }, 500);
+    return json({ error: err.message }, 404);
   }
 }
 
-async function handleRebuildChunk(request, env) {
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
+// ---------------------------------------------------------------------------
+// Progress summary — reads state from R2
+// ---------------------------------------------------------------------------
+async function handleProgress(env) {
+  const [fragellaBrandsState, mergeState, imagesState] = await Promise.all([
+    env.MASTER_DB.get("state/sync-fragella-brands.json").then(o => o ? JSON.parse(o.text()) : null).catch(() => null),
+    env.MASTER_DB.get("state/fragella-merge.json").then(o => o ? JSON.parse(o.text()) : null).catch(() => null),
+    env.MASTER_DB.get("state/images-mirror.json").then(o => o ? JSON.parse(o.text()) : null).catch(() => null),
+  ]);
 
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const { reset = false, cursor = null } = body;
-
-  try {
-    let staging = { entries: [], scanned: 0, startedAt: new Date().toISOString() };
-    if (!reset) {
-      const existing = await env.MASTER_DB.get("state/rebuild-staging.json");
-      if (existing) {
-        try { staging = JSON.parse(await existing.text()); } catch {}
-      }
-    }
-
-    const listRes = await env.MASTER_DB.list({
-      prefix: "brands/",
-      cursor: cursor || undefined,
-      limit: REBUILD_CHUNK_SIZE,
-    });
-
-    const chunkKeys = listRes.objects
-      .map((o) => o.key)
-      .filter((k) => k !== "brands/index.json");
-
-    const records = await Promise.all(
-      chunkKeys.map(async (key) => {
-        try {
-          const obj = await env.MASTER_DB.get(key);
-          if (!obj) return null;
-          return JSON.parse(await obj.text());
-        } catch {
-          return null;
-        }
-      })
-    );
-
-    let added = 0;
-    for (const r of records) {
-      if (r && typeof r.id !== "undefined") {
-        staging.entries.push({
-          id: r.id,
-          name: r.name,
-          slug: r.slug,
-          popularityScore: r.popularityScore ?? null,
-        });
-        added++;
-      }
-    }
-    staging.scanned += chunkKeys.length;
-
-    const done = !listRes.truncated;
-
-    if (done) {
-      const finalEntries = staging.entries.sort((a, b) => a.id - b.id);
-
-      await env.MASTER_DB.put(
-        "brands/index.json",
-        JSON.stringify(finalEntries),
-        { httpMetadata: { contentType: "application/json" } }
-      );
-
-      await env.MASTER_DB.delete("state/rebuild-staging.json");
-
-      const finishedAt = new Date().toISOString();
-      await env.MASTER_DB.put(
-        "state/rebuild.json",
-        JSON.stringify({
-          status: "done",
-          startedAt: staging.startedAt,
-          finishedAt,
-          filesScanned: staging.scanned,
-          indexLength: finalEntries.length,
-        }),
-        { httpMetadata: { contentType: "application/json" } }
-      );
-
-      return json({
-        done: true,
-        processed: added,
-        totalSoFar: staging.scanned,
-        indexLength: finalEntries.length,
-        finishedAt,
-      });
-    }
-
-    await env.MASTER_DB.put(
-      "state/rebuild-staging.json",
-      JSON.stringify(staging),
-      { httpMetadata: { contentType: "application/json" } }
-    );
-
-    await env.MASTER_DB.put(
-      "state/rebuild.json",
-      JSON.stringify({
-        status: "running",
-        startedAt: staging.startedAt,
-        filesScanned: staging.scanned,
-        lastChunkAt: new Date().toISOString(),
-      }),
-      { httpMetadata: { contentType: "application/json" } }
-    );
-
-    return json({
-      done: false,
-      processed: added,
-      totalSoFar: staging.scanned,
-      nextCursor: listRes.cursor,
-    });
-  } catch (err) {
-    try {
-      await env.MASTER_DB.put(
-        "state/rebuild.json",
-        JSON.stringify({
-          status: "error",
-          error: err.message,
-          failedAt: new Date().toISOString(),
-        }),
-        { httpMetadata: { contentType: "application/json" } }
-      );
-    } catch {}
-    return json({ error: err.message }, 500);
-  }
+  return json({
+    fragellaBrandsFetch: fragellaBrandsState,
+    fragellaMerge: mergeState,
+    imagesMirror: imagesState,
+  });
 }
 
-// Cron: fetch Fragella brand data in a time-bounded loop.
-// Runs for up to 12 minutes per cron invocation, processing one brand per iteration.
-// State is persisted to R2 so each cron picks up where the last left off.
-async function fragellaFetchLoop(env) {
-  const DEADLINE = Date.now() + 12 * 60 * 1000; // 12 min max
-
+// ---------------------------------------------------------------------------
+// Cron: automatically trigger workflow batches
+// ---------------------------------------------------------------------------
+async function cronTrigger(env) {
   let allBrands = [];
   try {
     const indexObj = await env.MASTER_DB.get("brands/index.json");
@@ -1062,697 +208,217 @@ async function fragellaFetchLoop(env) {
     allBrands = JSON.parse(await indexObj.text());
   } catch { return; }
 
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalBrands: allBrands.length,
-    currentOffset: 0,
-    totalFetched: 0,
-    totalNoMatch: 0,
-    totalSkipped: 0,
-  };
-
-  try {
-    const stateObj = await env.MASTER_DB.get("state/sync-fragella-brands.json");
-    if (stateObj) {
-      const saved = JSON.parse(await stateObj.text());
-      if (saved.status === "done") {
-        console.log("Fragella brands fetch already complete");
-        return;
-      }
-      state = saved;
-    }
-  } catch {}
-
-  let processed = 0;
-
-  while (state.currentOffset < allBrands.length && Date.now() < DEADLINE) {
-    const brand = allBrands[state.currentOffset];
-    const brandName = brand.name || "";
-    const brandSlug = slugify(brandName);
-
-    // Skip if already fetched
-    let alreadyFetched = false;
+  let triggered = 0;
+  for (const brand of allBrands) {
+    const slug = slugify(brand.name);
+    // Only trigger for brands with Fragella data
     try {
-      const existing = await env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
-      if (existing) alreadyFetched = true;
-    } catch {}
+      const hasFragella = await env.MASTER_DB.get(`fragella-brands/${slug}.json`);
+      if (!hasFragella) continue;
+    } catch { continue; }
 
-    if (alreadyFetched) {
-      state.currentOffset++;
-      state.totalSkipped++;
-    } else {
-      let fragellaHits = [];
-      try {
-        const brandVariants = [
-          brandName,
-          brandName.replace(/^(Parfums?|Maison|House of|The|Les?|By)\s+/i, ""),
-        ].filter((v, i, a) => a.indexOf(v) === i);
-
-        for (const variant of brandVariants) {
-          const url = `${FRAGELLA_BASE}/brands/${encodeURIComponent(variant)}?limit=500`;
-          const res = await fetch(url, { headers: { "x-api-key": env.FRAGELLA_API_KEY } });
-          if (res.ok) {
-            const raw = await res.json();
-            const hits = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
-            if (hits.length > 0) { fragellaHits = hits; break; }
-          }
-        }
-      } catch {}
-
-      if (fragellaHits.length > 0) {
-        try {
-          await env.MASTER_DB.put(
-            `fragella-brands/${brandSlug}.json`,
-            JSON.stringify({ brandName, brandSlug, fetchedAt: new Date().toISOString(), count: fragellaHits.length, scents: fragellaHits }),
-            { httpMetadata: { contentType: "application/json" } }
-          );
-          state.totalFetched++;
-        } catch {}
-      } else {
-        state.totalNoMatch++;
-      }
-
-      state.currentOffset++;
-      processed++;
-    }
-
-    // Save state every 50 brands
-    if (processed % 50 === 0) {
-      try {
-        await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-      } catch {}
-    }
-  }
-
-  const done = state.currentOffset >= allBrands.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  try {
-    await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-  } catch {}
-
-  console.log(`Fragella fetch cron: processed ${processed} brands, total ${state.totalFetched} fetched, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
-}
-
-async function rebuildFullLoop(env, trigger) {
-  try {
-    await env.MASTER_DB.delete("state/rebuild-staging.json");
-    let cursor = null;
-    let safety = 100;
-    while (safety-- > 0) {
-      const res = await doOneChunkInternal(env, cursor);
-      if (res.done) {
-        console.log("Cron rebuild done:", res.indexLength, "entries");
-        return;
-      }
-      cursor = res.nextCursor;
-      if (!cursor) return;
-    }
-  } catch (err) {
-    console.error("Cron rebuild failed:", err.message);
-  }
-}
-
-async function doOneChunkInternal(env, cursor) {
-  let staging = { entries: [], scanned: 0, startedAt: new Date().toISOString() };
-  const existing = await env.MASTER_DB.get("state/rebuild-staging.json");
-  if (existing) {
-    try { staging = JSON.parse(await existing.text()); } catch {}
-  }
-
-  const listRes = await env.MASTER_DB.list({
-    prefix: "brands/",
-    cursor: cursor || undefined,
-    limit: REBUILD_CHUNK_SIZE,
-  });
-
-  const chunkKeys = listRes.objects
-    .map((o) => o.key)
-    .filter((k) => k !== "brands/index.json");
-
-  const records = await Promise.all(
-    chunkKeys.map(async (key) => {
-      try {
-        const obj = await env.MASTER_DB.get(key);
-        if (!obj) return null;
-        return JSON.parse(await obj.text());
-      } catch {
-        return null;
-      }
-    })
-  );
-
-  for (const r of records) {
-    if (r && typeof r.id !== "undefined") {
-      staging.entries.push({
-        id: r.id,
-        name: r.name,
-        slug: r.slug,
-        popularityScore: r.popularityScore ?? null,
-      });
-    }
-  }
-  staging.scanned += chunkKeys.length;
-
-  const done = !listRes.truncated;
-
-  if (done) {
-    const finalEntries = staging.entries.sort((a, b) => a.id - b.id);
-    await env.MASTER_DB.put("brands/index.json", JSON.stringify(finalEntries), {
-      httpMetadata: { contentType: "application/json" },
-    });
-    await env.MASTER_DB.delete("state/rebuild-staging.json");
-    await env.MASTER_DB.put(
-      "state/rebuild.json",
-      JSON.stringify({
-        status: "done",
-        startedAt: staging.startedAt,
-        finishedAt: new Date().toISOString(),
-        filesScanned: staging.scanned,
-        indexLength: finalEntries.length,
-        trigger,
-      }),
-      { httpMetadata: { contentType: "application/json" } }
-    );
-    return { done: true, indexLength: finalEntries.length };
-  }
-
-  await env.MASTER_DB.put(
-    "state/rebuild-staging.json",
-    JSON.stringify(staging),
-    { httpMetadata: { contentType: "application/json" } }
-  );
-
-  return { done: false, nextCursor: listRes.cursor };
-}
-
-async function listAllKeys(env, prefix) {
-  const keys = [];
-  let cursor = undefined;
-  let truncated = true;
-  while (truncated) {
-    const res = await env.MASTER_DB.list({ prefix, cursor, limit: 1000 });
-    for (const obj of res.objects) keys.push(obj.key);
-    truncated = res.truncated;
-    cursor = res.cursor;
-  }
-  return keys;
-}
-
-// ---------------------------------------------------------------------------
-// /api/sync-fragella-brands — Phase 2a: fast Fragella brand data fetch.
-//
-// One Fragella API call per brand. Writes raw brand data to:
-//   fragella-brands/{slug}.json  ← all Fragella scents for this brand
-//
-// No catalog reads or writes. Pure speed — ~30 min for 6006 brands.
-// Resumable via state/sync-fragella-brands.json.
-//
-// POST body: { reset?: boolean }
-// ---------------------------------------------------------------------------
-async function handleSyncFragellaBrands(request, env) {
-  if (!env.FRAGELLA_API_KEY) return json({ error: "FRAGELLA_API_KEY not configured" }, 500);
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const reset = body.reset === true;
-
-  let allBrands = [];
-  try {
-    const indexObj = await env.MASTER_DB.get("brands/index.json");
-    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
-    allBrands = JSON.parse(await indexObj.text());
-  } catch (err) {
-    return json({ error: `Brand index load failed: ${err.message}` }, 500);
-  }
-
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalBrands: allBrands.length,
-    currentOffset: 0,
-    totalFetched: 0,
-    totalNoMatch: 0,
-    totalSkipped: 0,
-  };
-
-  if (!reset) {
+    const instanceId = `brand-${slug}`;
     try {
-      const stateObj = await env.MASTER_DB.get("state/sync-fragella-brands.json");
-      if (stateObj) {
-        const saved = JSON.parse(await stateObj.text());
-        if (saved.status !== "done") state = saved;
-      }
-    } catch {}
-  }
-
-  const offset = state.currentOffset;
-  if (offset >= allBrands.length) {
-    return json({ done: true, totalBrands: allBrands.length, totalFetched: state.totalFetched, totalNoMatch: state.totalNoMatch, note: "All brands fetched." });
-  }
-
-  const brand = allBrands[offset];
-  const brandName = brand.name || "";
-  const brandSlug = slugify(brandName);
-
-  // Skip if already fetched
-  if (!reset) {
-    try {
-      const existing = await env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
+      const existing = await env.CATALOG_WORKFLOW.get(instanceId).catch(() => null);
       if (existing) {
-        state.currentOffset = offset + 1;
-        state.totalSkipped++;
-        const done = state.currentOffset >= allBrands.length;
-        state.status = done ? "done" : "running";
-        if (done) state.finishedAt = new Date().toISOString();
-        await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-        return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, totalFetched: state.totalFetched, totalSkipped: state.totalSkipped, thisBrand: { skipped: true } });
+        const status = await existing.status();
+        if (status.status === "running" || status.status === "queued" || status.status === "complete") continue;
       }
+      await env.CATALOG_WORKFLOW.create({
+        id: instanceId,
+        params: { brandName: brand.name, brandSlug: slug },
+      });
+      triggered++;
+      if (triggered >= 20) break; // max 20 per cron run
     } catch {}
   }
+  console.log(`Cron: triggered ${triggered} workflow instances`);
+}
 
-  // Fetch from Fragella brand endpoint
-  let fragellaHits = [];
-  let fetchError = null;
-  try {
-    const brandVariants = [
+// ---------------------------------------------------------------------------
+// CatalogWorkflow — one instance per brand, three steps
+// ---------------------------------------------------------------------------
+export class CatalogWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const { brandName, brandSlug } = event.params;
+
+    // ── Step 1: Fragella merge ───────────────────────────────────────────────
+    // Read fragella-brands/{slug}.json and match scents into catalog records.
+    // Step result is persisted — if worker restarts, this step is skipped.
+    const mergeResult = await step.do(`merge-fragella-${brandSlug}`, async () => {
+      const feObj = await this.env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
+      if (!feObj) return { skipped: true, reason: "no fragella data" };
+
+      const fragellaData = JSON.parse(await feObj.text());
+      if (!fragellaData.scents?.length) return { skipped: true, reason: "empty scents" };
+
+      // Build name index
+      const fragellaIndex = {};
+      for (const h of fragellaData.scents) {
+        const normName = normalize(h.Name || h.name || "");
+        if (normName) fragellaIndex[normName] = h;
+      }
+
+      // List catalog records
+      let catalogKeys = [];
+      let cursor;
+      do {
+        const listRes = await this.env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        cursor = listRes.truncated ? listRes.cursor : null;
+      } while (cursor);
+
+      if (catalogKeys.length === 0) return { skipped: true, reason: "no catalog records" };
+
+      let enriched = 0;
+      let noMatch = 0;
+
+      await Promise.all(catalogKeys.map(async (key) => {
+        try {
+          const obj = await this.env.MASTER_DB.get(key);
+          if (!obj) return;
+          const record = JSON.parse(await obj.text());
+          if (record.fragella !== null && record.fragella !== undefined) return;
+
+          const normName = normalize(record.name || "");
+          const fe =
+            fragellaIndex[normName] ||
+            Object.entries(fragellaIndex).find(([k]) => k.includes(normName) && normName.length > 4)?.[1] ||
+            Object.entries(fragellaIndex).find(([k]) => normName.includes(k) && k.length > 4)?.[1] ||
+            null;
+
+          if (!fe) { noMatch++; return; }
+
+          record.fragella = {
+            matchType: "workflow-merge",
+            year: fe.Year || null,
+            country: fe.Country || null,
+            gender: fe.Gender || null,
+            oilType: fe.OilType || null,
+            longevity: fe.Longevity || null,
+            sillage: fe.Sillage || null,
+            popularity: fe.Popularity || null,
+            rating: fe.rating || null,
+            priceValue: fe["Price Value"] || null,
+            price: fe.Price || null,
+            imageUrl: fe["Image URL"] || null,
+            imageFallbacks: fe["Image Fallbacks"] || [],
+            purchaseUrl: fe["Purchase URL"] || null,
+            mainAccords: fe["Main Accords"] || [],
+            mainAccordsPercentage: fe["Main Accords Percentage"] || {},
+            generalNotes: fe["General Notes"] || [],
+            notes: fe.Notes || {},
+            seasonRanking: fe["Season Ranking"] || [],
+            occasionRanking: fe["Occasion Ranking"] || [],
+          };
+          record.syncedAt = new Date().toISOString();
+
+          await Promise.all([
+            this.env.MASTER_DB.put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } }),
+            this.env.MASTER_DB.put(`sources/fragella/${record.id}.json`, JSON.stringify(fe), { httpMetadata: { contentType: "application/json" } }),
+          ]);
+          enriched++;
+        } catch {}
+      }));
+
+      return { catalogRecords: catalogKeys.length, enriched, noMatch };
+    });
+
+    // ── Step 2: Mirror images ────────────────────────────────────────────────
+    // Download Fragplace + Fragella images to fragrances-images R2 bucket.
+    // 20 scents at a time to stay within CPU limits.
+    const imageResult = await step.do(`mirror-images-${brandSlug}`, async () => {
+      let catalogKeys = [];
+      let cursor;
+      do {
+        const listRes = await this.env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        cursor = listRes.truncated ? listRes.cursor : null;
+      } while (cursor);
+
+      let mirrored = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      // Process in chunks of 20
+      for (let i = 0; i < catalogKeys.length; i += 20) {
+        const chunk = catalogKeys.slice(i, i + 20);
+        await Promise.all(chunk.map(async (key) => {
+          try {
+            const obj = await this.env.MASTER_DB.get(key);
+            if (!obj) return;
+            const record = JSON.parse(await obj.text());
+            const id = record.id;
+            if (!id) return;
+
+            const downloads = [];
+
+            // Fragplace image
+            const fpUrl = record.fragplace?.imageUrl;
+            if (fpUrl) {
+              const fpKey = `fragplace/${id}.webp`;
+              const exists = await this.env.IMAGES_DB.get(fpKey).catch(() => null);
+              if (!exists) {
+                downloads.push(
+                  fetch(fpUrl).then(async r => {
+                    if (r.ok) {
+                      const buf = await r.arrayBuffer();
+                      await this.env.IMAGES_DB.put(fpKey, buf, { httpMetadata: { contentType: r.headers.get("content-type") || "image/webp" } });
+                      mirrored++;
+                    } else { failed++; }
+                  }).catch(() => { failed++; })
+                );
+              } else { skipped++; }
+            }
+
+            // Fragella image
+            const feUrl = record.fragella?.imageUrl;
+            if (feUrl && feUrl !== fpUrl) {
+              const feKey = `fragella/${id}.webp`;
+              const exists = await this.env.IMAGES_DB.get(feKey).catch(() => null);
+              if (!exists) {
+                downloads.push(
+                  fetch(feUrl).then(async r => {
+                    if (r.ok) {
+                      const buf = await r.arrayBuffer();
+                      await this.env.IMAGES_DB.put(feKey, buf, { httpMetadata: { contentType: r.headers.get("content-type") || "image/webp" } });
+                      mirrored++;
+                    } else { failed++; }
+                  }).catch(() => { failed++; })
+                );
+              } else { skipped++; }
+            }
+
+            await Promise.all(downloads);
+          } catch { failed++; }
+        }));
+      }
+
+      return { catalogRecords: catalogKeys.length, mirrored, skipped, failed };
+    });
+
+    return {
       brandName,
-      brandName.replace(/^(Parfums?|Maison|House of|The|Les?|By)\s+/i, ""),
-    ].filter((v, i, a) => a.indexOf(v) === i);
-
-    for (const variant of brandVariants) {
-      const url = `${FRAGELLA_BASE}/brands/${encodeURIComponent(variant)}?limit=500`;
-      const res = await fetch(url, { headers: { "x-api-key": env.FRAGELLA_API_KEY } });
-      if (res.ok) {
-        const raw = await res.json();
-        const hits = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
-        if (hits.length > 0) { fragellaHits = hits; break; }
-      }
-    }
-  } catch (err) {
-    fetchError = err.message;
+      brandSlug,
+      merge: mergeResult,
+      images: imageResult,
+      completedAt: new Date().toISOString(),
+    };
   }
-
-  state.currentOffset = offset + 1;
-  const done = state.currentOffset >= allBrands.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  if (fragellaHits.length > 0) {
-    await env.MASTER_DB.put(
-      `fragella-brands/${brandSlug}.json`,
-      JSON.stringify({ brandName, brandSlug, fetchedAt: new Date().toISOString(), count: fragellaHits.length, scents: fragellaHits }),
-      { httpMetadata: { contentType: "application/json" } }
-    );
-    state.totalFetched++;
-  } else {
-    state.totalNoMatch++;
-  }
-
-  await env.MASTER_DB.put("state/sync-fragella-brands.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-
-  return json({
-    done,
-    brandName,
-    offset,
-    nextOffset: done ? null : state.currentOffset,
-    totalBrands: allBrands.length,
-    totalFetched: state.totalFetched,
-    totalNoMatch: state.totalNoMatch,
-    totalSkipped: state.totalSkipped,
-    thisBrand: { fragellaHits: fragellaHits.length, error: fetchError },
-    finishedAt: done ? state.finishedAt : null,
-  });
 }
 
 // ---------------------------------------------------------------------------
-// /api/sync-fragella-merge — Phase 2b: merge Fragella data into catalog records.
-//
-// Reads fragella-brands/{slug}.json (from Phase 2a) and catalog records,
-// matches scents by normalized name, updates catalog with fragella field.
-// No external API calls — pure R2 read/write.
-// One brand per call, resumable.
-//
-// POST body: { reset?: boolean }
+// Helpers
 // ---------------------------------------------------------------------------
-async function handleSyncFragellaMerge(request, env) {
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const reset = body.reset === true;
-
-  function normalize(str) {
-    return (str || "")
-      .toLowerCase()
-      .replace(/[`\u2018\u2019''']/g, "")
-      .replace(/&/g, "and")
-      .replace(/[^\w\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  let allBrands = [];
-  try {
-    const indexObj = await env.MASTER_DB.get("brands/index.json");
-    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
-    allBrands = JSON.parse(await indexObj.text());
-  } catch (err) {
-    return json({ error: `Brand index load failed: ${err.message}` }, 500);
-  }
-
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalBrands: allBrands.length,
-    currentOffset: 0,
-    totalEnriched: 0,
-    totalNoMatch: 0,
-    totalSkipped: 0,
-  };
-
-  if (!reset) {
-    try {
-      const stateObj = await env.MASTER_DB.get("state/sync-fragella-merge.json");
-      if (stateObj) {
-        const saved = JSON.parse(await stateObj.text());
-        if (saved.status !== "done") state = saved;
-      }
-    } catch {}
-  }
-
-  const offset = state.currentOffset;
-  if (offset >= allBrands.length) {
-    return json({ done: true, totalBrands: allBrands.length, totalEnriched: state.totalEnriched, totalNoMatch: state.totalNoMatch, note: "Merge complete." });
-  }
-
-  const brand = allBrands[offset];
-  const brandName = brand.name || "";
-  const brandSlug = slugify(brandName);
-
-  // Load fragella brand data
-  let fragellaData = null;
-  try {
-    const feObj = await env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
-    if (feObj) fragellaData = JSON.parse(await feObj.text());
-  } catch {}
-
-  if (!fragellaData || !fragellaData.scents?.length) {
-    state.currentOffset = offset + 1;
-    state.totalSkipped++;
-    const done = state.currentOffset >= allBrands.length;
-    state.status = done ? "done" : "running";
-    if (done) state.finishedAt = new Date().toISOString();
-    await env.MASTER_DB.put("state/sync-fragella-merge.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-    return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, totalEnriched: state.totalEnriched, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "no fragella data" } });
-  }
-
-  // Build Fragella name index
-  const fragellaIndex = {};
-  for (const h of fragellaData.scents) {
-    const normName = normalize(h.Name || h.name || "");
-    if (normName) fragellaIndex[normName] = h;
-  }
-
-  // List catalog records for this brand
-  let catalogKeys = [];
-  try {
-    let cursor;
-    do {
-      const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
-      cursor = listRes.truncated ? listRes.cursor : null;
-    } while (cursor);
-  } catch {}
-
-  if (catalogKeys.length === 0) {
-    state.currentOffset = offset + 1;
-    state.totalSkipped++;
-    const done = state.currentOffset >= allBrands.length;
-    state.status = done ? "done" : "running";
-    if (done) state.finishedAt = new Date().toISOString();
-    await env.MASTER_DB.put("state/sync-fragella-merge.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-    return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, totalEnriched: state.totalEnriched, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "no catalog records" } });
-  }
-
-  let enriched = 0;
-  let noMatch = 0;
-
-  // Process in batches of 100
-  const batch = catalogKeys.slice(0, 100);
-  await Promise.all(batch.map(async (key) => {
-    try {
-      const obj = await env.MASTER_DB.get(key);
-      if (!obj) return;
-      const record = JSON.parse(await obj.text());
-      if (record.fragella !== null && record.fragella !== undefined) return;
-
-      const normName = normalize(record.name || "");
-      const fe =
-        fragellaIndex[normName] ||
-        Object.entries(fragellaIndex).find(([k]) => k.includes(normName) && normName.length > 4)?.[1] ||
-        Object.entries(fragellaIndex).find(([k]) => normName.includes(k) && k.length > 4)?.[1] ||
-        null;
-
-      if (!fe) { noMatch++; return; }
-
-      record.fragella = {
-        matchType: "brand-merge",
-        year: fe.Year || null,
-        country: fe.Country || null,
-        gender: fe.Gender || null,
-        oilType: fe.OilType || null,
-        longevity: fe.Longevity || null,
-        sillage: fe.Sillage || null,
-        popularity: fe.Popularity || null,
-        rating: fe.rating || null,
-        priceValue: fe["Price Value"] || null,
-        price: fe.Price || null,
-        imageUrl: fe["Image URL"] || null,
-        imageFallbacks: fe["Image Fallbacks"] || [],
-        purchaseUrl: fe["Purchase URL"] || null,
-        mainAccords: fe["Main Accords"] || [],
-        mainAccordsPercentage: fe["Main Accords Percentage"] || {},
-        generalNotes: fe["General Notes"] || [],
-        notes: fe.Notes || {},
-        seasonRanking: fe["Season Ranking"] || [],
-        occasionRanking: fe["Occasion Ranking"] || [],
-      };
-      record.syncedAt = new Date().toISOString();
-
-      await Promise.all([
-        env.MASTER_DB.put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } }),
-        env.MASTER_DB.put(`sources/fragella/${record.id}.json`, JSON.stringify(fe), { httpMetadata: { contentType: "application/json" } }),
-      ]);
-      enriched++;
-    } catch {}
-  }));
-
-  // Advance only when all catalog records processed
-  const fullyDone = batch.length >= catalogKeys.length;
-  if (fullyDone) {
-    state.currentOffset = offset + 1;
-    state.totalEnriched += enriched;
-    state.totalNoMatch += noMatch;
-  } else {
-    state.totalEnriched += enriched;
-    state.totalNoMatch += noMatch;
-  }
-
-  const done = fullyDone && state.currentOffset >= allBrands.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  await env.MASTER_DB.put("state/sync-fragella-merge.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-
-  return json({
-    done,
-    brandName,
-    offset,
-    nextOffset: done ? null : state.currentOffset,
-    totalBrands: allBrands.length,
-    totalEnriched: state.totalEnriched,
-    totalNoMatch: state.totalNoMatch,
-    totalSkipped: state.totalSkipped,
-    thisBrand: { catalogRecords: catalogKeys.length, enriched, noMatch, fullyDone },
-    finishedAt: done ? state.finishedAt : null,
-  });
+function normalize(str) {
+  return (str || "")
+    .toLowerCase()
+    .replace(/[`\u2018\u2019''']/g, "")
+    .replace(/&/g, "and")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
-
-
-// ---------------------------------------------------------------------------
-// /api/sync-images — Phase 2b-img: mirror images from Fragplace + Fragella to R2.
-//
-// For each brand in the index, reads catalog records and downloads:
-//   - sources/fragplace image → images/fragplace/{scent-id}.jpg
-//   - sources/fragella image  → images/fragella/{scent-id}.jpg
-//
-// Writes to komanda-images R2 bucket (binding: IMAGES_DB).
-// One brand per call — loop until done: true. Skips already-mirrored images.
-// No external API calls beyond image downloads.
-//
-// POST body: { reset?: boolean }
-// ---------------------------------------------------------------------------
-async function handleSyncImages(request, env) {
-  if (!env.MASTER_DB) return json({ error: "MASTER_DB R2 binding not configured" }, 500);
-  if (!env.IMAGES_DB) return json({ error: "IMAGES_DB R2 binding not configured" }, 500);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const reset = body.reset === true;
-
-  let allBrands = [];
-  try {
-    const indexObj = await env.MASTER_DB.get("brands/index.json");
-    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
-    allBrands = JSON.parse(await indexObj.text());
-  } catch (err) {
-    return json({ error: `Brand index load failed: ${err.message}` }, 500);
-  }
-
-  let state = {
-    startedAt: new Date().toISOString(),
-    status: "running",
-    totalBrands: allBrands.length,
-    currentOffset: 0,
-    totalMirrored: 0,
-    totalSkipped: 0,
-    totalFailed: 0,
-  };
-
-  if (!reset) {
-    try {
-      const stateObj = await env.MASTER_DB.get("state/sync-images.json");
-      if (stateObj) {
-        const saved = JSON.parse(await stateObj.text());
-        if (saved.status !== "done") state = saved;
-      }
-    } catch {}
-  }
-
-  const offset = state.currentOffset;
-  if (offset >= allBrands.length) {
-    return json({ done: true, totalBrands: allBrands.length, totalMirrored: state.totalMirrored, totalSkipped: state.totalSkipped, note: "Image mirror complete." });
-  }
-
-  const brand = allBrands[offset];
-  const brandName = brand.name || "";
-  const brandSlug = slugify(brandName);
-
-  // List catalog records for this brand
-  let catalogKeys = [];
-  try {
-    let cursor;
-    do {
-      const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
-      cursor = listRes.truncated ? listRes.cursor : null;
-    } while (cursor);
-  } catch {}
-
-  if (catalogKeys.length === 0) {
-    state.currentOffset = offset + 1;
-    state.totalSkipped++;
-    const done = state.currentOffset >= allBrands.length;
-    state.status = done ? "done" : "running";
-    if (done) state.finishedAt = new Date().toISOString();
-    await env.MASTER_DB.put("state/sync-images.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-    return json({ done, brandName, offset, nextOffset: done ? null : state.currentOffset, totalBrands: allBrands.length, totalMirrored: state.totalMirrored, totalSkipped: state.totalSkipped, thisBrand: { skipped: true, reason: "no catalog records" } });
-  }
-
-  let mirrored = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  // Process up to 20 scents per call to stay within CPU limits
-  const batch = catalogKeys.slice(0, 20);
-
-  await Promise.all(batch.map(async (key) => {
-    try {
-      const obj = await env.MASTER_DB.get(key);
-      if (!obj) return;
-      const record = JSON.parse(await obj.text());
-      const id = record.id;
-      if (!id) return;
-
-      const downloads = [];
-
-      // Fragplace image
-      const fpUrl = record.fragplace?.imageUrl;
-      if (fpUrl) {
-        const fpKey = `fragplace/${id}.webp`;
-        const existing = await env.IMAGES_DB.get(fpKey).catch(() => null);
-        if (!existing) {
-          downloads.push(
-            fetch(fpUrl)
-              .then(async r => {
-                if (r.ok) {
-                  const buf = await r.arrayBuffer();
-                  const ct = r.headers.get("content-type") || "image/webp";
-                  await env.IMAGES_DB.put(fpKey, buf, { httpMetadata: { contentType: ct } });
-                  mirrored++;
-                } else { failed++; }
-              })
-              .catch(() => { failed++; })
-          );
-        } else { skipped++; }
-      }
-
-      // Fragella image
-      const feUrl = record.fragella?.imageUrl;
-      if (feUrl && feUrl !== fpUrl) {
-        const feKey = `fragella/${id}.webp`;
-        const existing = await env.IMAGES_DB.get(feKey).catch(() => null);
-        if (!existing) {
-          downloads.push(
-            fetch(feUrl)
-              .then(async r => {
-                if (r.ok) {
-                  const buf = await r.arrayBuffer();
-                  const ct = r.headers.get("content-type") || "image/webp";
-                  await env.IMAGES_DB.put(feKey, buf, { httpMetadata: { contentType: ct } });
-                  mirrored++;
-                } else { failed++; }
-              })
-              .catch(() => { failed++; })
-          );
-        } else { skipped++; }
-      }
-
-      await Promise.all(downloads);
-    } catch { failed++; }
-  }));
-
-  // Only advance if this was not a full batch (brand has >20 scents — come back)
-  const fullyDone = batch.length >= catalogKeys.length;
-  if (fullyDone) state.currentOffset = offset + 1;
-  state.totalMirrored += mirrored;
-  state.totalSkipped += skipped;
-  state.totalFailed += failed;
-
-  const done = fullyDone && state.currentOffset >= allBrands.length;
-  state.status = done ? "done" : "running";
-  if (done) state.finishedAt = new Date().toISOString();
-
-  await env.MASTER_DB.put("state/sync-images.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
-
-  return json({
-    done,
-    brandName,
-    offset,
-    nextOffset: done ? null : state.currentOffset,
-    totalBrands: allBrands.length,
-    totalMirrored: state.totalMirrored,
-    totalSkipped: state.totalSkipped,
-    totalFailed: state.totalFailed,
-    thisBrand: { catalogRecords: catalogKeys.length, batchSize: batch.length, mirrored, skipped, failed, fullyDone },
-    finishedAt: done ? state.finishedAt : null,
-  });
-}
-
 
 function slugify(s) {
   return (s || "")
