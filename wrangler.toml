@@ -16,6 +16,11 @@ name = "fragrances-catalog-workflow"
 binding = "CATALOG_WORKFLOW"
 class_name = "CatalogWorkflow"
 
+[[d1_databases]]
+binding = "CATALOG_DB"
+database_name = "fragrances-catalog-db"
+database_id = "1713638f-2116-40c7-ac71-976a0f5f6b27"
+
 [limits]
 cpu_ms = 300000
 
