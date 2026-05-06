@@ -60,7 +60,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     console.log("Cron fired:", event.cron);
-    ctx.waitUntil(startAllWorkflows(env));
+    ctx.waitUntil(cronReindex(env));
   },
 };
 
@@ -478,6 +478,105 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
     };
   }
 }
+
+// Cron: run reindex in a time-bounded loop — processes brands until 12 min deadline
+async function cronReindex(env) {
+  const DEADLINE = Date.now() + 12 * 60 * 1000;
+
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return;
+    allBrands = JSON.parse(await indexObj.text());
+  } catch { return; }
+
+  let state = { currentOffset: 0, totalIndexed: 0, totalBrands: allBrands.length, status: "running" };
+  try {
+    const stateObj = await env.MASTER_DB.get("state/reindex.json");
+    if (stateObj) {
+      const saved = JSON.parse(await stateObj.text());
+      if (saved.status === "done") { console.log("Reindex already complete"); return; }
+      state = saved;
+    }
+  } catch {}
+
+  let brandsProcessed = 0;
+
+  while (state.currentOffset < allBrands.length && Date.now() < DEADLINE) {
+    const brand = allBrands[state.currentOffset];
+    const brandSlug = slugify(brand.name);
+
+    let catalogKeys = [];
+    try {
+      let cursor;
+      do {
+        const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        cursor = listRes.truncated ? listRes.cursor : null;
+      } while (cursor);
+    } catch {}
+
+    let indexed = 0;
+    for (let i = 0; i < catalogKeys.length; i += 50) {
+      const batch = catalogKeys.slice(i, i + 50);
+      const records = await Promise.all(batch.map(async key => {
+        try {
+          const obj = await env.MASTER_DB.get(key);
+          return obj ? JSON.parse(await obj.text()) : null;
+        } catch { return null; }
+      }));
+
+      const stmt = env.CATALOG_DB.prepare(`
+        INSERT OR REPLACE INTO products
+          (id, category, brand, brand_slug, name, slug, gender, year, country,
+           longevity, sillage, popularity, rating, main_accords, image_url,
+           has_fragplace, has_fragella, has_image, synced_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+
+      const d1batch = records.filter(r => r && r.id).map(r => stmt.bind(
+        String(r.id), "fragrances",
+        r.brand || "", r.brandSlug || "",
+        r.name || "", r.slug || "",
+        r.fragella?.gender || null, r.fragella?.year || null,
+        r.fragella?.country || null, r.fragella?.longevity || null,
+        r.fragella?.sillage || null, r.fragella?.popularity || null,
+        r.fragella?.rating || null,
+        r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
+        r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
+        r.fragplace ? 1 : 0, r.fragella ? 1 : 0,
+        (r.fragella?.imageUrl || r.fragplace?.imageUrl) ? 1 : 0,
+        r.syncedAt || new Date().toISOString(),
+      ));
+
+      if (d1batch.length > 0) {
+        try { await env.CATALOG_DB.batch(d1batch); indexed += d1batch.length; } catch {}
+      }
+    }
+
+    state.currentOffset++;
+    state.totalIndexed += indexed;
+    brandsProcessed++;
+
+    // Save state every 10 brands
+    if (brandsProcessed % 10 === 0) {
+      try {
+        await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+      } catch {}
+    }
+  }
+
+  const done = state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  try {
+    await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+  } catch {}
+
+  console.log(`Reindex cron: ${brandsProcessed} brands, ${state.totalIndexed} total indexed, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
+}
+
 
 // ---------------------------------------------------------------------------
 // /api/reindex — direct R2 → D1 indexing, bypasses Workflow
