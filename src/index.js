@@ -43,6 +43,10 @@ export default {
       return handleStatus(url, env);
     }
 
+    if (url.pathname === "/api/reindex" && request.method === "POST") {
+      return handleReindex(request, env, ctx);
+    }
+
     if (url.pathname === "/api/search" && request.method === "GET") {
       return handleSearch(url, env);
     }
@@ -475,6 +479,130 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
   }
 }
 
+// ---------------------------------------------------------------------------
+// /api/reindex — direct R2 → D1 indexing, bypasses Workflow
+// Reads catalog records brand by brand, writes to D1.
+// One brand per call — loop until done: true.
+// POST body: { reset?: boolean }
+// ---------------------------------------------------------------------------
+async function handleReindex(request, env, ctx) {
+  if (!env.MASTER_DB) return json({ error: "MASTER_DB not configured" }, 500);
+  if (!env.CATALOG_DB) return json({ error: "CATALOG_DB not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const reset = body.reset === true;
+
+  let allBrands = [];
+  try {
+    const indexObj = await env.MASTER_DB.get("brands/index.json");
+    if (!indexObj) return json({ error: "brands/index.json not found" }, 500);
+    allBrands = JSON.parse(await indexObj.text());
+  } catch (err) {
+    return json({ error: `Brand index load failed: ${err.message}` }, 500);
+  }
+
+  let state = { currentOffset: 0, totalIndexed: 0, totalBrands: allBrands.length, status: "running" };
+  if (!reset) {
+    try {
+      const stateObj = await env.MASTER_DB.get("state/reindex.json");
+      if (stateObj) {
+        const saved = JSON.parse(await stateObj.text());
+        if (saved.status !== "done") state = saved;
+      }
+    } catch {}
+  }
+
+  const offset = state.currentOffset;
+  if (offset >= allBrands.length) {
+    return json({ done: true, totalBrands: allBrands.length, totalIndexed: state.totalIndexed });
+  }
+
+  const brand = allBrands[offset];
+  const brandSlug = slugify(brand.name);
+
+  // List catalog records for this brand
+  let catalogKeys = [];
+  try {
+    let cursor;
+    do {
+      const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
+      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+      cursor = listRes.truncated ? listRes.cursor : null;
+    } while (cursor);
+  } catch {}
+
+  let indexed = 0;
+
+  if (catalogKeys.length > 0) {
+    for (let i = 0; i < catalogKeys.length; i += 50) {
+      const batch = catalogKeys.slice(i, i + 50);
+      const records = await Promise.all(batch.map(async key => {
+        try {
+          const obj = await env.MASTER_DB.get(key);
+          return obj ? JSON.parse(await obj.text()) : null;
+        } catch { return null; }
+      }));
+
+      const stmt = env.CATALOG_DB.prepare(`
+        INSERT OR REPLACE INTO products
+          (id, category, brand, brand_slug, name, slug, gender, year, country,
+           longevity, sillage, popularity, rating, main_accords, image_url,
+           has_fragplace, has_fragella, has_image, synced_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+
+      const d1batch = records
+        .filter(r => r && r.id)
+        .map(r => stmt.bind(
+          String(r.id), "fragrances",
+          r.brand || "", r.brandSlug || "",
+          r.name || "", r.slug || "",
+          r.fragella?.gender || null,
+          r.fragella?.year || null,
+          r.fragella?.country || null,
+          r.fragella?.longevity || null,
+          r.fragella?.sillage || null,
+          r.fragella?.popularity || null,
+          r.fragella?.rating || null,
+          r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
+          r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
+          r.fragplace ? 1 : 0,
+          r.fragella ? 1 : 0,
+          (r.fragella?.imageUrl || r.fragplace?.imageUrl) ? 1 : 0,
+          r.syncedAt || new Date().toISOString(),
+        ));
+
+      if (d1batch.length > 0) {
+        try {
+          await env.CATALOG_DB.batch(d1batch);
+          indexed += d1batch.length;
+        } catch {}
+      }
+    }
+  }
+
+  state.currentOffset = offset + 1;
+  state.totalIndexed += indexed;
+  const done = state.currentOffset >= allBrands.length;
+  state.status = done ? "done" : "running";
+  if (done) state.finishedAt = new Date().toISOString();
+
+  await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
+
+  return json({
+    done,
+    brandName: brand.name,
+    offset,
+    nextOffset: done ? null : state.currentOffset,
+    totalBrands: allBrands.length,
+    totalIndexed: state.totalIndexed,
+    thisBrand: { catalogRecords: catalogKeys.length, indexed },
+    finishedAt: done ? state.finishedAt : null,
+  });
+}
+
+
 function normalize(str) {
   return (str || "").toLowerCase().replace(/[`\u2018\u2019''']/g, "").replace(/&/g, "and").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -486,3 +614,6 @@ function slugify(s) {
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), { status, headers: corsHeaders });
 }
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
