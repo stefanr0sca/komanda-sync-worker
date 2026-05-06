@@ -51,6 +51,10 @@ export default {
       return handleGeminiTest(request, env);
     }
 
+    if (url.pathname.startsWith("/api/export/") && request.method === "GET") {
+      return handleExport(url, env);
+    }
+
     if (url.pathname === "/api/search" && request.method === "GET") {
       return handleSearch(url, env);
     }
@@ -818,6 +822,290 @@ Return ONLY valid JSON in this exact structure, no markdown, no preamble:
     gender: scent.gender,
     languagesGenerated: Object.keys(geminiResponse.descriptions || {}).length,
     result: geminiResponse,
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// /api/export/{platform} — export catalog as marketplace-ready feed
+// Platforms: emag, trendyol, shopify, csv
+// Params: brands (comma-separated slugs), limit, offset, gender, markup, stock
+// ---------------------------------------------------------------------------
+async function handleExport(url, env) {
+  const platform = url.pathname.split("/")[3];
+  if (!["emag", "trendyol", "shopify", "csv"].includes(platform)) {
+    return json({ error: `Unknown platform. Use: emag, trendyol, shopify, csv` }, 400);
+  }
+
+  const brandsParam = url.searchParams.get("brands") || "";
+  const brandSlugs = brandsParam ? brandsParam.split(",").map(b => slugify(b.trim())).filter(Boolean) : [];
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 2000);
+  const offset = parseInt(url.searchParams.get("offset") || "0");
+  const gender = url.searchParams.get("gender") || "";
+
+  const conditions = ["category = 'fragrances'", "has_image = 1"];
+  const params = [];
+
+  if (brandSlugs.length > 0) {
+    conditions.push(`brand_slug IN (${brandSlugs.map(() => "?").join(",")})`);
+    params.push(...brandSlugs);
+  }
+  if (gender) { conditions.push("gender = ?"); params.push(gender); }
+
+  const sql = `SELECT * FROM products WHERE ${conditions.join(" AND ")} ORDER BY popularity DESC, rating DESC LIMIT ? OFFSET ?`;
+  params.push(limit, offset);
+
+  let products;
+  try {
+    const result = await env.CATALOG_DB.prepare(sql).bind(...params).all();
+    products = result.results.map(r => ({ ...r, main_accords: r.main_accords ? JSON.parse(r.main_accords) : [] }));
+  } catch (err) {
+    return json({ error: `D1 query failed: ${err.message}` }, 500);
+  }
+
+  if (platform === "emag")     return formatEMag(products, url);
+  if (platform === "trendyol") return formatTrendyol(products, url);
+  if (platform === "shopify")  return formatShopify(products, url);
+  return formatCSV(products, url);
+}
+
+// Helper: escape CSV field
+function csvField(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+// Helper: estimate price from popularity (placeholder until real prices from suppliers)
+function estimatePrice(p, markup = 1.4) {
+  const base = p.popularity === "Very high" ? 89.99 :
+               p.popularity === "High" ? 69.99 :
+               p.popularity === "Moderate" ? 49.99 : 34.99;
+  return (base * markup).toFixed(2);
+}
+
+// ---------------------------------------------------------------------------
+// eMag formatter — CSV feed compatible with eMag Marketplace
+// Matches existing eMag catalog products by EAN (no human validation needed)
+// ---------------------------------------------------------------------------
+function formatEMag(products, url) {
+  const markup = parseFloat(url.searchParams.get("markup") || "1.4");
+  const stock = url.searchParams.get("stock") || "10";
+  const market = url.searchParams.get("market") || "ro";
+
+  const marketConfig = {
+    ro: { currency: "RON", vatRate: 19, apiBase: "marketplace.emag.ro",
+          gender: { men: "Parfum masculin", women: "Parfum feminin", unisex: "Parfum unisex" } },
+    bg: { currency: "BGN", vatRate: 20, apiBase: "marketplace.emag.bg",
+          gender: { men: "Мъжки парфюм", women: "Дамски парфюм", unisex: "Унисекс парфюм" } },
+    hu: { currency: "HUF", vatRate: 27, apiBase: "marketplace.emag.hu",
+          gender: { men: "Férfi parfüm", women: "Női parfüm", unisex: "Uniszex parfüm" } },
+  };
+  const cfg = marketConfig[market] || marketConfig.ro;
+
+  const headers = [
+    "seller_id", "ean", "name", "brand", "part_number", "description",
+    "image_url", "gender", "longevity", "sillage", "main_accords",
+    "year", "country", "sale_price", "min_sale_price", "max_sale_price",
+    "currency", "vat_rate", "stock", "market", "api_base",
+    "has_fragplace", "has_fragella"
+  ];
+
+  const rows = products.map(p => {
+    const price = estimatePrice(p, markup);
+    const minPrice = (parseFloat(price) * 0.85).toFixed(2);
+    const maxPrice = (parseFloat(price) * 1.15).toFixed(2);
+    const genderKey = p.gender === "men" ? "men" : p.gender === "women" ? "women" : "unisex";
+    const desc = `${p.name} ${cfg.gender[genderKey]}. ${p.main_accords.slice(0,3).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}`;
+    return [
+      p.id, p.ean || "", `${p.brand} ${p.name}`, p.brand, p.slug,
+      desc, p.image_url || "",
+      p.gender || "", p.longevity || "", p.sillage || "",
+      p.main_accords.join("|"), p.year || "", p.country || "",
+      price, minPrice, maxPrice,
+      cfg.currency, cfg.vatRate, stock, market, cfg.apiBase,
+      p.has_fragplace, p.has_fragella
+    ].map(csvField).join(",");
+  });
+
+  const csv = [headers.join(","), ...rows].join("\n");
+  return new Response(csv, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="emag-${market}-export-${Date.now()}.csv"`,
+      "Access-Control-Allow-Origin": "*",
+    }
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// Trendyol formatter — JSON feed for Trendyol product API
+// Uses barcode (EAN) as primary identifier
+// POST to: POST /integration/product/sellers/{sellerId}/products
+// ---------------------------------------------------------------------------
+function formatTrendyol(products, url) {
+  const markup = parseFloat(url.searchParams.get("markup") || "1.4");
+  const stock = parseInt(url.searchParams.get("stock") || "10");
+  const market = url.searchParams.get("market") || "ro";
+
+  const marketConfig = {
+    ro: { currency: "RON", vatRate: 19,
+          categories: { men: "Parfum Bărbați", women: "Parfum Femei", unisex: "Parfum Unisex" },
+          attrs: { gender: "Gen", year: "An", country: "Țara de origine", longevity: "Longevitate", sillage: "Sillage" } },
+    tr: { currency: "TRY", vatRate: 20,
+          categories: { men: "Erkek Parfüm", women: "Kadın Parfüm", unisex: "Unisex Parfüm" },
+          attrs: { gender: "Cinsiyet", year: "Yıl", country: "Menşei", longevity: "Kalıcılık", sillage: "Sillage" } },
+    de: { currency: "EUR", vatRate: 19,
+          categories: { men: "Herrenparfüm", women: "Damenparfüm", unisex: "Unisex Parfüm" },
+          attrs: { gender: "Geschlecht", year: "Jahr", country: "Herkunftsland", longevity: "Haltbarkeit", sillage: "Sillage" } },
+    nl: { currency: "EUR", vatRate: 21,
+          categories: { men: "Herengeur", women: "Damegeur", unisex: "Unisex Geur" },
+          attrs: { gender: "Geslacht", year: "Jaar", country: "Land van herkomst", longevity: "Houdbaarheid", sillage: "Sillage" } },
+  };
+  const cfg = marketConfig[market] || marketConfig.ro;
+
+  const items = products.map(p => {
+    const price = parseFloat(estimatePrice(p, markup));
+    const genderKey = p.gender === "men" ? "men" : p.gender === "women" ? "women" : "unisex";
+    const desc = `${p.name} by ${p.brand}. Main accords: ${p.main_accords.slice(0,5).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}${p.sillage ? ` Sillage: ${p.sillage}.` : ""}`;
+    return {
+      barcode: p.ean || String(p.id),
+      title: `${p.brand} ${p.name}`,
+      productMainId: String(p.id),
+      brandName: p.brand,
+      categoryName: cfg.categories[genderKey],
+      quantity: stock,
+      stockCode: p.slug,
+      dimensionalWeight: 0.5,
+      description: desc,
+      currencyType: cfg.currency,
+      listPrice: parseFloat((price * 1.1).toFixed(2)),
+      salePrice: price,
+      vatRate: cfg.vatRate,
+      images: p.image_url ? [{ url: p.image_url }] : [],
+      attributes: [
+        p.gender    ? { attributeName: cfg.attrs.gender,    attributeValue: p.gender } : null,
+        p.year      ? { attributeName: cfg.attrs.year,      attributeValue: String(p.year) } : null,
+        p.country   ? { attributeName: cfg.attrs.country,   attributeValue: p.country } : null,
+        p.longevity ? { attributeName: cfg.attrs.longevity, attributeValue: p.longevity } : null,
+        p.sillage   ? { attributeName: cfg.attrs.sillage,   attributeValue: p.sillage } : null,
+      ].filter(Boolean),
+      _meta: { market, has_ean: !!p.ean, has_fragella: !!p.has_fragella, rating: p.rating }
+    };
+  });
+
+  return new Response(JSON.stringify({ market, items, total: items.length, exportedAt: new Date().toISOString() }, null, 2), {
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Disposition": `attachment; filename="trendyol-${market}-export-${Date.now()}.json"`,
+      "Access-Control-Allow-Origin": "*",
+    }
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// Shopify formatter — CSV compatible with Shopify product import
+// https://help.shopify.com/en/manual/products/import-export/using-csv
+// ---------------------------------------------------------------------------
+function formatShopify(products, url) {
+  const markup = parseFloat(url.searchParams.get("markup") || "1.4");
+  const vendor = url.searchParams.get("vendor") || "";
+  const published = url.searchParams.get("published") || "TRUE";
+
+  const headers = [
+    "Handle", "Title", "Body (HTML)", "Vendor", "Product Category",
+    "Type", "Tags", "Published",
+    "Option1 Name", "Option1 Value",
+    "Variant SKU", "Variant Grams", "Variant Inventory Tracker",
+    "Variant Inventory Qty", "Variant Inventory Policy",
+    "Variant Fulfillment Service", "Variant Price", "Variant Compare At Price",
+    "Variant Requires Shipping", "Variant Taxable", "Variant Barcode",
+    "Image Src", "Image Position", "Image Alt Text",
+    "Gift Card", "SEO Title", "SEO Description",
+    "Google Shopping / Gender", "Status"
+  ];
+
+  const rows = products.map(p => {
+    const price = estimatePrice(p, markup);
+    const comparePrice = (parseFloat(price) * 1.2).toFixed(2);
+    const tags = [
+      p.gender, p.country,
+      ...p.main_accords.slice(0, 5),
+      p.longevity, p.sillage,
+      "fragrance", "perfume", p.brand
+    ].filter(Boolean).join(", ");
+
+    const description = `<p>${p.name} by ${p.brand}.</p>
+<p>Main accords: ${p.main_accords.slice(0,5).join(", ")}.</p>
+${p.longevity ? `<p>Longevity: ${p.longevity}.</p>` : ""}
+${p.sillage ? `<p>Sillage: ${p.sillage}.</p>` : ""}
+${p.year ? `<p>Year: ${p.year}.</p>` : ""}`;
+
+    return [
+      p.slug,
+      `${p.brand} ${p.name}`,
+      description,
+      vendor || p.brand,
+      "Health & Beauty > Personal Care > Cosmetics > Perfume & Cologne",
+      "Parfum",
+      tags,
+      published,
+      "Volume", "100ml",
+      p.slug,
+      "500",
+      "shopify",
+      "10", "deny", "manual",
+      price, comparePrice,
+      "TRUE", "TRUE",
+      p.ean || "",
+      p.image_url || "",
+      "1",
+      `${p.brand} ${p.name}`,
+      "FALSE",
+      `${p.brand} ${p.name} - Perfume`,
+      `${p.name} by ${p.brand}. ${p.main_accords.slice(0,3).join(", ")}.`,
+      p.gender === "men" ? "Male" : p.gender === "women" ? "Female" : "Unisex",
+      "active"
+    ].map(csvField).join(",");
+  });
+
+  const csv = [headers.join(","), ...rows].join("\n");
+  return new Response(csv, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="shopify-export-${Date.now()}.csv"`,
+      "Access-Control-Allow-Origin": "*",
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Generic CSV formatter — master export with all fields
+// ---------------------------------------------------------------------------
+function formatCSV(products, url) {
+  const headers = [
+    "id", "brand", "brand_slug", "name", "slug", "gender", "year", "country",
+    "longevity", "sillage", "popularity", "rating", "main_accords",
+    "image_url", "ean", "has_fragplace", "has_fragella", "has_image", "synced_at"
+  ];
+
+  const rows = products.map(p => [
+    p.id, p.brand, p.brand_slug, p.name, p.slug, p.gender || "", p.year || "",
+    p.country || "", p.longevity || "", p.sillage || "", p.popularity || "",
+    p.rating || "", p.main_accords.join("|"), p.image_url || "", p.ean || "",
+    p.has_fragplace, p.has_fragella, p.has_image, p.synced_at
+  ].map(csvField).join(","));
+
+  const csv = [headers.join(","), ...rows].join("\n");
+  return new Response(csv, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="catalog-export-${Date.now()}.csv"`,
+      "Access-Control-Allow-Origin": "*",
+    }
   });
 }
 
