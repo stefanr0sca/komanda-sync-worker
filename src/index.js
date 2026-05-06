@@ -47,6 +47,10 @@ export default {
       return handleReindex(request, env, ctx);
     }
 
+    if (url.pathname === "/api/gemini/test" && request.method === "POST") {
+      return handleGeminiTest(request, env);
+    }
+
     if (url.pathname === "/api/search" && request.method === "GET") {
       return handleSearch(url, env);
     }
@@ -698,6 +702,122 @@ async function handleReindex(request, env, ctx) {
     totalIndexed: state.totalIndexed,
     thisBrand: { catalogRecords: catalogKeys.length, indexed },
     finishedAt: done ? state.finishedAt : null,
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// /api/gemini/test — test Gemini description generation for one scent
+// POST body: { scentId?: string, brandSlug?: string }
+// Defaults to Dior Sauvage if not specified
+// ---------------------------------------------------------------------------
+async function handleGeminiTest(request, env) {
+  if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY not configured" }, 500);
+  if (!env.CATALOG_DB) return json({ error: "CATALOG_DB not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const brandSlug = body.brandSlug || "dior";
+  const scentId = body.scentId || null;
+
+  // Fetch a scent from D1
+  let scent;
+  try {
+    if (scentId) {
+      scent = await env.CATALOG_DB.prepare(
+        "SELECT * FROM products WHERE id = ?"
+      ).bind(scentId).first();
+    } else {
+      scent = await env.CATALOG_DB.prepare(
+        "SELECT * FROM products WHERE brand_slug = ? AND has_fragella = 1 ORDER BY popularity DESC LIMIT 1"
+      ).bind(brandSlug).first();
+    }
+  } catch (err) {
+    return json({ error: `D1 query failed: ${err.message}` }, 500);
+  }
+
+  if (!scent) return json({ error: `No scent found for brand "${brandSlug}"` }, 404);
+
+  const accords = scent.main_accords ? JSON.parse(scent.main_accords) : [];
+
+  // Build prompt
+  const prompt = `You are a luxury fragrance copywriter. Generate multilingual product descriptions for this fragrance.
+
+FRAGRANCE DATA:
+Brand: ${scent.brand}
+Name: ${scent.name}
+Gender: ${scent.gender || "unisex"}
+Year: ${scent.year || "unknown"}
+Country: ${scent.country || "unknown"}
+Longevity: ${scent.longevity || "unknown"}
+Sillage: ${scent.sillage || "unknown"}
+Main Accords: ${accords.join(", ") || "unknown"}
+Rating: ${scent.rating || "unknown"}/5
+
+Generate descriptions in ALL of the following languages. Each description should be 2-3 sentences, evocative, and feel native to that language — not translated. Also generate one short signature sentence per language (max 15 words) that captures the essence of the scent poetically.
+
+Languages: English (en), Romanian (ro), French (fr), German (de), Spanish (es), Italian (it), Portuguese (pt), Arabic (ar), Russian (ru), Chinese Simplified (zh), Japanese (ja), Korean (ko), Hindi (hi), Bengali (bn), Turkish (tr), Dutch (nl), Polish (pl), Swedish (sv), Norwegian (no), Danish (da), Finnish (fi), Greek (el), Hebrew (he), Persian (fa), Indonesian (id), Malay (ms), Thai (th), Vietnamese (vi), Ukrainian (uk), Czech (cs), Slovak (sk), Hungarian (hu), Bulgarian (bg), Croatian (hr), Serbian (sr), Swahili (sw), Hausa (ha), Amharic (am), Tamil (ta), Telugu (te)
+
+Also generate 3 universal occasion tags from: [date, office, casual, special, evening, sport, beach, winter, summer, spring, autumn, romantic, wedding, travel, formal]
+
+Return ONLY valid JSON in this exact structure, no markdown, no preamble:
+{
+  "scent": "${scent.name}",
+  "brand": "${scent.brand}",
+  "descriptions": {
+    "en": { "desc": "...", "signature": "..." },
+    "ro": { "desc": "...", "signature": "..." },
+    "fr": { "desc": "...", "signature": "..." }
+  },
+  "occasions": ["tag1", "tag2", "tag3"]
+}`;
+
+  // Call Gemini
+  const geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + env.GEMINI_API_KEY;
+
+  let geminiResponse;
+  try {
+    const res = await fetch(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 8192,
+          responseMimeType: "application/json",
+        }
+      })
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      return json({ error: `Gemini API error ${res.status}`, detail: err.slice(0, 500) }, 500);
+    }
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    try {
+      geminiResponse = JSON.parse(text);
+    } catch {
+      return json({ error: "Gemini returned invalid JSON", raw: text.slice(0, 1000) }, 500);
+    }
+  } catch (err) {
+    return json({ error: `Gemini fetch failed: ${err.message}` }, 500);
+  }
+
+  return json({
+    scentId: scent.id,
+    scentName: scent.name,
+    brand: scent.brand,
+    accords,
+    longevity: scent.longevity,
+    sillage: scent.sillage,
+    gender: scent.gender,
+    languagesGenerated: Object.keys(geminiResponse.descriptions || {}).length,
+    result: geminiResponse,
   });
 }
 
