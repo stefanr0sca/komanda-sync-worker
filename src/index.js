@@ -21,6 +21,7 @@ export default {
         "GET  /api/search                    — search products",
         "GET  /api/product/{category}/{id}   — single product",
         "POST /api/reindex                   — reindex one brand per call",
+        "POST /api/reindex/all               — reindex all brands in background",
         "POST /api/shopify/sync              — sync to Shopify",
         "POST /api/gemini/test               — test Gemini descriptions",
       ] });
@@ -34,6 +35,10 @@ export default {
     }
     if (url.pathname === "/api/workflow/status" && request.method === "GET") {
       return handleStatus(url, env);
+    }
+    if (url.pathname === "/api/reindex/all" && request.method === "POST") {
+      ctx.waitUntil(cronReindex(env));
+      return json({ status: "running", message: "Full reindex started in background. Cloudflare will process all brands.", checkStateAt: "R2 state/reindex.json" });
     }
     if (url.pathname === "/api/reindex" && request.method === "POST") {
       return handleReindex(request, env, ctx);
@@ -168,15 +173,15 @@ async function indexBrandFromR2(brandSlug, masterDb, catalogDb) {
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 async function handleSearch(url, env) {
-  const q            = url.searchParams.get("q") || "";
-  const brand        = url.searchParams.get("brand") || "";
-  const gender       = url.searchParams.get("gender") || "";
-  const category     = url.searchParams.get("category") || "fragrances";
-  const minRating    = parseFloat(url.searchParams.get("minRating") || "0");
+  const q             = url.searchParams.get("q") || "";
+  const brand         = url.searchParams.get("brand") || "";
+  const gender        = url.searchParams.get("gender") || "";
+  const category      = url.searchParams.get("category") || "fragrances";
+  const minRating     = parseFloat(url.searchParams.get("minRating") || "0");
   const minPopularity = parseFloat(url.searchParams.get("minPopularity") || "0");
-  const limit        = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
-  const offset       = parseInt(url.searchParams.get("offset") || "0");
-  const sortBy       = url.searchParams.get("sortBy") || "popularity";
+  const limit         = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
+  const offset        = parseInt(url.searchParams.get("offset") || "0");
+  const sortBy        = url.searchParams.get("sortBy") || "popularity";
 
   const conditions = ["category = ?"];
   const params = [category];
@@ -185,9 +190,9 @@ async function handleSearch(url, env) {
     conditions.push("(name LIKE ? OR brand LIKE ? OR main_accords LIKE ? OR notes_all LIKE ?)");
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
-  if (brand)         { conditions.push("brand_slug LIKE ?"); params.push(`%${slugify(brand)}%`); }
-  if (gender)        { conditions.push("gender = ?"); params.push(gender); }
-  if (minRating > 0) { conditions.push("rating >= ?"); params.push(minRating); }
+  if (brand)          { conditions.push("brand_slug LIKE ?"); params.push(`%${slugify(brand)}%`); }
+  if (gender)         { conditions.push("gender = ?"); params.push(gender); }
+  if (minRating > 0)  { conditions.push("rating >= ?"); params.push(minRating); }
   if (minPopularity > 0) { conditions.push("popularity >= ?"); params.push(minPopularity); }
 
   const orderCol = sortBy === "rating" ? "rating" : sortBy === "name" ? "name" : "popularity";
@@ -288,7 +293,6 @@ async function startAllWorkflows(env) {
   console.log(`Workflows: ${JSON.stringify(counts)} / ${brandsToStart.length} total`);
 }
 
-// handleTest no longer polls — returns instanceId immediately, caller uses /api/workflow/status
 async function handleTest(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
@@ -452,7 +456,7 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
   }
 }
 
-// ─── Cron reindex ─────────────────────────────────────────────────────────────
+// ─── Cron + background reindex ────────────────────────────────────────────────
 
 async function cronReindex(env) {
   const DEADLINE = Date.now() + 12 * 60 * 1000;
@@ -489,10 +493,10 @@ async function cronReindex(env) {
   state.status = done ? "done" : "running";
   if (done) state.finishedAt = new Date().toISOString();
   try { await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } }); } catch {}
-  console.log(`Reindex cron: ${brandsProcessed} brands, ${state.totalIndexed} total, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
+  console.log(`Reindex: ${brandsProcessed} brands, ${state.totalIndexed} total, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
 }
 
-// ─── Manual reindex ───────────────────────────────────────────────────────────
+// ─── Manual reindex (one brand per call) ─────────────────────────────────────
 
 async function handleReindex(request, env, ctx) {
   if (!env.MASTER_DB) return json({ error: "MASTER_DB not configured" }, 500);
@@ -671,31 +675,31 @@ async function handleShopifySync(request, env, ctx) {
 
   if (products.length === 0) return json({ done: true, message: "No products found", offset, limit });
 
-  const base64    = `https://${env.SHOPIFY_STORE}/admin/api/2024-01`;
+  const shopifyBase    = `https://${env.SHOPIFY_STORE}/admin/api/2024-01`;
   const shopifyHeaders = { "Content-Type": "application/json", "X-Shopify-Access-Token": env.SHOPIFY_TOKEN };
-  const results   = { created: 0, skipped: 0, failed: 0, errors: [] };
+  const results        = { created: 0, skipped: 0, failed: 0, errors: [] };
 
   for (const p of products) {
     let existingId = null;
     try {
-      const checkRes = await fetch(`${base64}/products.json?handle=${p.slug}&fields=id,handle&limit=1`, { headers: shopifyHeaders });
+      const checkRes = await fetch(`${shopifyBase}/products.json?handle=${p.slug}&fields=id,handle&limit=1`, { headers: shopifyHeaders });
       if (checkRes.ok) { const cd = await checkRes.json(); if (cd.products?.length > 0) existingId = cd.products[0].id; }
     } catch {}
     if (existingId) { results.skipped++; continue; }
 
-    const basePrice  = p.popularity === "Very high" ? 89.99 : p.popularity === "High" ? 69.99 : p.popularity === "Moderate" ? 49.99 : 34.99;
-    const price      = (basePrice * markup).toFixed(2);
+    const basePrice    = p.popularity === "Very high" ? 89.99 : p.popularity === "High" ? 69.99 : p.popularity === "Moderate" ? 49.99 : 34.99;
+    const price        = (basePrice * markup).toFixed(2);
     const comparePrice = (basePrice * markup * 1.2).toFixed(2);
-    const tags       = [p.gender, p.country, ...p.main_accords.slice(0, 5), p.longevity, p.sillage, p.oil_type, "fragrance", "perfume", p.brand].filter(Boolean).join(", ");
-    const bodyHtml   = [
+    const tags         = [p.gender, p.country, ...p.main_accords.slice(0, 5), p.longevity, p.sillage, p.oil_type, "fragrance", "perfume", p.brand].filter(Boolean).join(", ");
+    const bodyHtml     = [
       `<p>${p.name} by ${p.brand}.</p>`,
-      p.main_accords.length    ? `<p>Main accords: ${p.main_accords.slice(0, 5).join(", ")}.</p>` : "",
-      p.notes_top?.length      ? `<p>Top notes: ${p.notes_top.join(", ")}.</p>` : "",
-      p.notes_middle?.length   ? `<p>Heart notes: ${p.notes_middle.join(", ")}.</p>` : "",
-      p.notes_base?.length     ? `<p>Base notes: ${p.notes_base.join(", ")}.</p>` : "",
-      p.longevity              ? `<p>Longevity: ${p.longevity}.</p>` : "",
-      p.sillage                ? `<p>Sillage: ${p.sillage}.</p>` : "",
-      p.year                   ? `<p>Year: ${p.year}.</p>` : "",
+      p.main_accords.length  ? `<p>Main accords: ${p.main_accords.slice(0, 5).join(", ")}.</p>` : "",
+      p.notes_top?.length    ? `<p>Top notes: ${p.notes_top.join(", ")}.</p>`    : "",
+      p.notes_middle?.length ? `<p>Heart notes: ${p.notes_middle.join(", ")}.</p>` : "",
+      p.notes_base?.length   ? `<p>Base notes: ${p.notes_base.join(", ")}.</p>`  : "",
+      p.longevity            ? `<p>Longevity: ${p.longevity}.</p>`               : "",
+      p.sillage              ? `<p>Sillage: ${p.sillage}.</p>`                   : "",
+      p.year                 ? `<p>Year: ${p.year}.</p>`                         : "",
     ].filter(Boolean).join("\n");
 
     const product = {
@@ -712,10 +716,10 @@ async function handleShopifySync(request, env, ctx) {
     };
 
     try {
-      const createRes = await fetch(`${base64}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
+      const createRes = await fetch(`${shopifyBase}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
       if (createRes.status === 429) {
         await new Promise(r => setTimeout(r, 2000));
-        const retry = await fetch(`${base64}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
+        const retry = await fetch(`${shopifyBase}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
         if (retry.ok) results.created++; else { results.failed++; results.errors.push({ id: p.id, slug: p.slug, status: retry.status }); }
       } else if (createRes.ok) {
         results.created++;
@@ -787,12 +791,12 @@ function formatTrendyol(products, url) {
       currencyType: cfg.currency, listPrice: parseFloat((price * 1.1).toFixed(2)), salePrice: price, vatRate: cfg.vatRate,
       images: p.image_url ? [{ url: p.image_url }] : [],
       attributes: [
-        p.gender   ? { attributeName: cfg.attrs.gender,   attributeValue: p.gender }        : null,
-        p.year     ? { attributeName: cfg.attrs.year,     attributeValue: String(p.year) }  : null,
-        p.country  ? { attributeName: cfg.attrs.country,  attributeValue: p.country }       : null,
-        p.longevity? { attributeName: cfg.attrs.longevity,attributeValue: p.longevity }     : null,
-        p.sillage  ? { attributeName: cfg.attrs.sillage,  attributeValue: p.sillage }       : null,
-        p.oil_type ? { attributeName: "Tip",              attributeValue: p.oil_type }      : null,
+        p.gender    ? { attributeName: cfg.attrs.gender,    attributeValue: p.gender }        : null,
+        p.year      ? { attributeName: cfg.attrs.year,      attributeValue: String(p.year) }  : null,
+        p.country   ? { attributeName: cfg.attrs.country,   attributeValue: p.country }       : null,
+        p.longevity ? { attributeName: cfg.attrs.longevity, attributeValue: p.longevity }     : null,
+        p.sillage   ? { attributeName: cfg.attrs.sillage,   attributeValue: p.sillage }       : null,
+        p.oil_type  ? { attributeName: "Tip",               attributeValue: p.oil_type }      : null,
       ].filter(Boolean),
       _meta: { market, has_ean: !!p.ean, has_fragella: !!p.has_fragella, rating: p.rating, perfumers: p.perfumers }
     };
@@ -801,19 +805,19 @@ function formatTrendyol(products, url) {
 }
 
 function formatShopify(products, url) {
-  const markup   = parseFloat(url.searchParams.get("markup") || "1.4");
-  const vendor   = url.searchParams.get("vendor") || "";
+  const markup    = parseFloat(url.searchParams.get("markup") || "1.4");
+  const vendor    = url.searchParams.get("vendor") || "";
   const published = url.searchParams.get("published") || "TRUE";
-  const headers  = ["Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published","Option1 Name","Option1 Value","Variant SKU","Variant Grams","Variant Inventory Tracker","Variant Inventory Qty","Variant Inventory Policy","Variant Fulfillment Service","Variant Price","Variant Compare At Price","Variant Requires Shipping","Variant Taxable","Variant Barcode","Image Src","Image Position","Image Alt Text","Gift Card","SEO Title","SEO Description","Google Shopping / Gender","Status"];
+  const headers   = ["Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published","Option1 Name","Option1 Value","Variant SKU","Variant Grams","Variant Inventory Tracker","Variant Inventory Qty","Variant Inventory Policy","Variant Fulfillment Service","Variant Price","Variant Compare At Price","Variant Requires Shipping","Variant Taxable","Variant Barcode","Image Src","Image Position","Image Alt Text","Gift Card","SEO Title","SEO Description","Google Shopping / Gender","Status"];
   const rows = products.map(p => {
     const price = estimatePrice(p, markup);
     const tags  = [p.gender, p.country, ...p.main_accords.slice(0, 5), p.longevity, p.sillage, p.oil_type, "fragrance", "perfume", p.brand].filter(Boolean).join(", ");
     const body  = [
       `<p>${p.name} by ${p.brand}.</p>`,
       `<p>Main accords: ${p.main_accords.slice(0, 5).join(", ")}.</p>`,
-      p.notes_top?.length    ? `<p>Top notes: ${p.notes_top.join(", ")}.</p>`    : "",
+      p.notes_top?.length    ? `<p>Top notes: ${p.notes_top.join(", ")}.</p>`      : "",
       p.notes_middle?.length ? `<p>Heart notes: ${p.notes_middle.join(", ")}.</p>` : "",
-      p.notes_base?.length   ? `<p>Base notes: ${p.notes_base.join(", ")}.</p>`  : "",
+      p.notes_base?.length   ? `<p>Base notes: ${p.notes_base.join(", ")}.</p>`    : "",
       p.longevity ? `<p>Longevity: ${p.longevity}.</p>` : "",
       p.sillage   ? `<p>Sillage: ${p.sillage}.</p>`     : "",
       p.year      ? `<p>Year: ${p.year}.</p>`            : "",
