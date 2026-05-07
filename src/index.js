@@ -895,7 +895,7 @@ function formatEMag(products, url) {
   const market = url.searchParams.get("market") || "ro";
 
   const marketConfig = {
-    ro: { currency: "RON", vatRate: 19, apiBase: "marketplace.emag.ro",
+    ro: { currency: "RON", vatRate: 21, apiBase: "marketplace.emag.ro",
           gender: { men: "Parfum masculin", women: "Parfum feminin", unisex: "Parfum unisex" } },
     bg: { currency: "BGN", vatRate: 20, apiBase: "marketplace.emag.bg",
           gender: { men: "Мъжки парфюм", women: "Дамски парфюм", unisex: "Унисекс парфюм" } },
@@ -951,7 +951,7 @@ function formatTrendyol(products, url) {
   const market = url.searchParams.get("market") || "ro";
 
   const marketConfig = {
-    ro: { currency: "RON", vatRate: 19,
+    ro: { currency: "RON", vatRate: 21,
           categories: { men: "Parfum Bărbați", women: "Parfum Femei", unisex: "Parfum Unisex" },
           attrs: { gender: "Gen", year: "An", country: "Țara de origine", longevity: "Longevitate", sillage: "Sillage" } },
     tr: { currency: "TRY", vatRate: 20,
