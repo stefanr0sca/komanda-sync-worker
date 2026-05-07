@@ -1,82 +1,64 @@
-// src/index.js
-// Fragrances Catalog Worker + Workflow + Search
-
-import { WorkflowEntrypoint } from 'cloudflare:workers';
-
-const FRAGELLA_BASE = "https://api.fragella.com/api/v1";
+import { WorkflowEntrypoint } from "cloudflare:workers";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Content-Type": "application/json",
+  "Content-Type": "application/json"
 };
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
-
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({ worker: "fragrances-catalog-worker", status: "ok", endpoints: [
         "POST /api/workflow/start            — trigger all brands",
         "POST /api/workflow/test             — test one brand {brandSlug?}",
         "GET  /api/workflow/status?id=<id>   — instance status",
         "GET  /api/search                    — search products (see params below)",
-        "GET  /api/product/{category}/{id}   — single product",
-      ]});
+        "GET  /api/product/{category}/{id}   — single product"
+      ] });
     }
-
     if (url.pathname === "/api/workflow/start" && request.method === "POST") {
       ctx.waitUntil(startAllWorkflows(env));
       return json({ status: "triggering", message: "Creating/restarting workflow instances in background." });
     }
-
     if (url.pathname === "/api/workflow/test" && request.method === "POST") {
       return handleTest(request, env);
     }
-
     if (url.pathname === "/api/workflow/status" && request.method === "GET") {
       return handleStatus(url, env);
     }
-
     if (url.pathname === "/api/reindex" && request.method === "POST") {
       return handleReindex(request, env, ctx);
     }
-
     if (url.pathname === "/api/gemini/test" && request.method === "POST") {
       return handleGeminiTest(request, env);
     }
-
     if (url.pathname.startsWith("/api/export/") && request.method === "GET") {
       return handleExport(url, env);
     }
-
     if (url.pathname === "/api/search" && request.method === "GET") {
       return handleSearch(url, env);
     }
-
     if (url.pathname.startsWith("/api/product/") && request.method === "GET") {
       return handleProduct(url, env);
     }
-
+    if (url.pathname === "/api/shopify/sync" && request.method === "POST") {
+      return handleShopifySync(request, env, ctx);
+    }
     return json({ error: "Not found" }, 404);
   },
 
   async scheduled(event, env, ctx) {
     console.log("Cron fired:", event.cron);
     ctx.waitUntil(cronReindex(env));
-  },
+  }
 };
 
-// ---------------------------------------------------------------------------
-// Search endpoint
-// GET /api/search?q=oud&brand=lattafa&gender=male&category=fragrances
-//                &minRating=7&minPopularity=5&limit=20&offset=0
-// ---------------------------------------------------------------------------
 async function handleSearch(url, env) {
   const q = url.searchParams.get("q") || "";
   const brand = url.searchParams.get("brand") || "";
@@ -86,7 +68,7 @@ async function handleSearch(url, env) {
   const minPopularity = parseFloat(url.searchParams.get("minPopularity") || "0");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
   const offset = parseInt(url.searchParams.get("offset") || "0");
-  const sortBy = url.searchParams.get("sortBy") || "popularity"; // popularity | rating | name
+  const sortBy = url.searchParams.get("sortBy") || "popularity";
 
   let conditions = ["category = ?"];
   let params = [category];
@@ -116,36 +98,29 @@ async function handleSearch(url, env) {
   const where = conditions.join(" AND ");
   const sql = `SELECT * FROM products WHERE ${where} ORDER BY ${orderCol} DESC LIMIT ? OFFSET ?`;
   params.push(limit, offset);
-
   const countSql = `SELECT COUNT(*) as total FROM products WHERE ${where}`;
 
   try {
     const [results, countResult] = await Promise.all([
       env.CATALOG_DB.prepare(sql).bind(...params).all(),
-      env.CATALOG_DB.prepare(countSql).bind(...params.slice(0, -2)).first(),
+      env.CATALOG_DB.prepare(countSql).bind(...params.slice(0, -2)).first()
     ]);
-
     return json({
       total: countResult?.total || 0,
       limit,
       offset,
-      results: results.results.map(r => ({
+      results: results.results.map((r) => ({
         ...r,
-        main_accords: r.main_accords ? JSON.parse(r.main_accords) : [],
-      })),
+        main_accords: r.main_accords ? JSON.parse(r.main_accords) : []
+      }))
     });
   } catch (err) {
     return json({ error: err.message }, 500);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Single product
-// GET /api/product/fragrances/{id}
-// ---------------------------------------------------------------------------
 async function handleProduct(url, env) {
   const parts = url.pathname.split("/").filter(Boolean);
-  // /api/product/{category}/{id}
   const category = parts[2] || "fragrances";
   const id = parts[3];
   if (!id) return json({ error: "id required" }, 400);
@@ -154,34 +129,32 @@ async function handleProduct(url, env) {
     const row = await env.CATALOG_DB.prepare(
       "SELECT * FROM products WHERE id = ? AND category = ?"
     ).bind(id, category).first();
-
     if (!row) return json({ error: "Not found" }, 404);
 
-    // Also fetch full catalog record from R2 for complete data
+    // FIX: o.text() returns a Promise, must be awaited
     const fullRecord = await env.MASTER_DB.get(`catalog/${row.brand_slug}/${id}.json`)
-      .then(o => o ? JSON.parse(o.text()) : null)
+      .then(async (o) => o ? JSON.parse(await o.text()) : null)
       .catch(() => null);
 
     return json({
       ...row,
       main_accords: row.main_accords ? JSON.parse(row.main_accords) : [],
-      full: fullRecord,
+      full: fullRecord
     });
   } catch (err) {
     return json({ error: err.message }, 500);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Workflow management
-// ---------------------------------------------------------------------------
 async function startAllWorkflows(env) {
   let allBrands = [];
   try {
     const indexObj = await env.MASTER_DB.get("brands/index.json");
     if (!indexObj) return;
     allBrands = JSON.parse(await indexObj.text());
-  } catch { return; }
+  } catch {
+    return;
+  }
 
   const fragellaKeys = new Set();
   try {
@@ -193,23 +166,29 @@ async function startAllWorkflows(env) {
       }
       cursor = listRes.truncated ? listRes.cursor : null;
     } while (cursor);
-  } catch { return; }
+  } catch {
+    return;
+  }
 
-  const brandsToStart = allBrands.filter(b => fragellaKeys.has(slugify(b.name)));
-
+  const brandsToStart = allBrands.filter((b) => fragellaKeys.has(slugify(b.name)));
   const results = await Promise.allSettled(brandsToStart.map(async (brand) => {
     const slug = slugify(brand.name);
     const instanceId = `brand-${slug}`;
     try {
       const existing = await env.CATALOG_WORKFLOW.get(instanceId);
       const status = await existing.status();
-      if (status.status === "errored") { await existing.restart(); return "restarted"; }
-      if (["complete","running","queued"].includes(status.status)) return status.status;
+      if (status.status === "errored") {
+        await existing.restart();
+        return "restarted";
+      }
+      if (["complete", "running", "queued"].includes(status.status)) return status.status;
     } catch {}
     try {
       await env.CATALOG_WORKFLOW.create({ id: instanceId, params: { brandName: brand.name, brandSlug: slug } });
       return "started";
-    } catch { return "skipped"; }
+    } catch {
+      return "skipped";
+    }
   }));
 
   const counts = { started: 0, restarted: 0, running: 0, complete: 0, skipped: 0 };
@@ -222,11 +201,12 @@ async function handleTest(request, env) {
   try { body = await request.json(); } catch {}
   const testSlug = body.brandSlug || "dior";
   let brandName = testSlug;
+
   try {
     const indexObj = await env.MASTER_DB.get("brands/index.json");
     if (indexObj) {
       const brands = JSON.parse(await indexObj.text());
-      const match = brands.find(b => slugify(b.name) === testSlug);
+      const match = brands.find((b) => slugify(b.name) === testSlug);
       if (match) brandName = match.name;
     }
   } catch {}
@@ -239,7 +219,7 @@ async function handleTest(request, env) {
   try {
     instance = await env.CATALOG_WORKFLOW.create({
       id: testInstanceId,
-      params: { brandName, brandSlug: testSlug },
+      params: { brandName, brandSlug: testSlug }
     });
   } catch (err) {
     return json({ error: `Failed to create test instance: ${err.message}` }, 500);
@@ -248,16 +228,18 @@ async function handleTest(request, env) {
   const start = Date.now();
   let finalStatus;
   while (Date.now() - start < 90000) {
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 2000));
     try {
       const s = await instance.status();
-      if (s.status === "complete" || s.status === "errored") { finalStatus = s; break; }
+      if (s.status === "complete" || s.status === "errored") {
+        finalStatus = s;
+        break;
+      }
     } catch {}
   }
 
   if (!finalStatus) return json({ status: "timeout", instanceId: testInstanceId });
 
-  // Check D1 index
   const d1Count = await env.CATALOG_DB.prepare(
     "SELECT COUNT(*) as cnt FROM products WHERE brand_slug = ? AND category = 'fragrances'"
   ).bind(testSlug).first().catch(() => null);
@@ -269,7 +251,7 @@ async function handleTest(request, env) {
     workflowStatus: finalStatus.status,
     workflowOutput: finalStatus.output,
     workflowError: finalStatus.error || null,
-    d1IndexedRecords: d1Count?.cnt || 0,
+    d1IndexedRecords: d1Count?.cnt || 0
   });
 }
 
@@ -285,14 +267,10 @@ async function handleStatus(url, env) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// CatalogWorkflow — merge + images + D1 index
-// ---------------------------------------------------------------------------
 export class CatalogWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     const { brandName, brandSlug } = event.payload;
 
-    // Step 1: Merge Fragella into catalog records
     const mergeResult = await step.do(`merge-${brandSlug}`, async () => {
       const feObj = await this.env.MASTER_DB.get(`fragella-brands/${brandSlug}.json`);
       if (!feObj) return { skipped: true, reason: "no fragella data" };
@@ -309,7 +287,7 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
       let cursor;
       do {
         const listRes = await this.env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        catalogKeys = catalogKeys.concat(listRes.objects.map((o) => o.key));
         cursor = listRes.truncated ? listRes.cursor : null;
       } while (cursor);
 
@@ -324,34 +302,40 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
           if (record.fragella != null) return;
 
           const normName = normalize(record.name || "");
-          const fe = fragellaIndex[normName] ||
-            Object.entries(fragellaIndex).find(([k]) => k.includes(normName) && normName.length > 4)?.[1] ||
-            Object.entries(fragellaIndex).find(([k]) => normName.includes(k) && k.length > 4)?.[1] ||
-            null;
+          const fe = fragellaIndex[normName]
+            || Object.entries(fragellaIndex).find(([k]) => k.includes(normName) && normName.length > 4)?.[1]
+            || Object.entries(fragellaIndex).find(([k]) => normName.includes(k) && k.length > 4)?.[1]
+            || null;
 
           if (!fe) { noMatch++; return; }
 
           record.fragella = {
             matchType: "workflow-merge",
-            year: fe.Year || null, country: fe.Country || null,
-            gender: fe.Gender || null, oilType: fe.OilType || null,
-            longevity: fe.Longevity || null, sillage: fe.Sillage || null,
-            popularity: fe.Popularity || null, rating: fe.rating || null,
-            priceValue: fe["Price Value"] || null, price: fe.Price || null,
-            imageUrl: fe["Image URL"] || null, imageFallbacks: fe["Image Fallbacks"] || [],
+            year: fe.Year || null,
+            country: fe.Country || null,
+            gender: fe.Gender || null,
+            oilType: fe.OilType || null,
+            longevity: fe.Longevity || null,
+            sillage: fe.Sillage || null,
+            popularity: fe.Popularity || null,
+            rating: fe.rating || null,
+            priceValue: fe["Price Value"] || null,
+            price: fe.Price || null,
+            imageUrl: fe["Image URL"] || null,
+            imageFallbacks: fe["Image Fallbacks"] || [],
             purchaseUrl: fe["Purchase URL"] || null,
             mainAccords: fe["Main Accords"] || [],
             mainAccordsPercentage: fe["Main Accords Percentage"] || {},
             generalNotes: fe["General Notes"] || [],
             notes: fe.Notes || {},
             seasonRanking: fe["Season Ranking"] || [],
-            occasionRanking: fe["Occasion Ranking"] || [],
+            occasionRanking: fe["Occasion Ranking"] || []
           };
           record.syncedAt = new Date().toISOString();
 
           await Promise.all([
             this.env.MASTER_DB.put(key, JSON.stringify(record), { httpMetadata: { contentType: "application/json" } }),
-            this.env.MASTER_DB.put(`sources/fragella/${record.id}.json`, JSON.stringify(fe), { httpMetadata: { contentType: "application/json" } }),
+            this.env.MASTER_DB.put(`sources/fragella/${record.id}.json`, JSON.stringify(fe), { httpMetadata: { contentType: "application/json" } })
           ]);
           enriched++;
         } catch {}
@@ -360,13 +344,12 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
       return { catalogRecords: catalogKeys.length, enriched, noMatch };
     });
 
-    // Step 2: Mirror images
     const imageResult = await step.do(`images-${brandSlug}`, async () => {
       let catalogKeys = [];
       let cursor;
       do {
         const listRes = await this.env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        catalogKeys = catalogKeys.concat(listRes.objects.map((o) => o.key));
         cursor = listRes.truncated ? listRes.cursor : null;
       } while (cursor);
 
@@ -379,16 +362,18 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
             const record = JSON.parse(await obj.text());
             const id = record.id;
             if (!id) return;
-            const tasks = [];
 
+            const tasks = [];
             const fpUrl = record.fragplace?.imageUrl;
             if (fpUrl) {
               const fpKey = `fragplace/${id}.webp`;
               const exists = await this.env.IMAGES_DB.get(fpKey).catch(() => null);
               if (!exists) {
-                tasks.push(fetch(fpUrl).then(async r => {
-                  if (r.ok) { await this.env.IMAGES_DB.put(fpKey, await r.arrayBuffer(), { httpMetadata: { contentType: r.headers.get("content-type") || "image/jpeg" } }); mirrored++; }
-                  else failed++;
+                tasks.push(fetch(fpUrl).then(async (r) => {
+                  if (r.ok) {
+                    await this.env.IMAGES_DB.put(fpKey, await r.arrayBuffer(), { httpMetadata: { contentType: r.headers.get("content-type") || "image/jpeg" } });
+                    mirrored++;
+                  } else failed++;
                 }).catch(() => { failed++; }));
               } else skipped++;
             }
@@ -398,9 +383,11 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
               const feKey = `fragella/${id}.webp`;
               const exists = await this.env.IMAGES_DB.get(feKey).catch(() => null);
               if (!exists) {
-                tasks.push(fetch(feUrl).then(async r => {
-                  if (r.ok) { await this.env.IMAGES_DB.put(feKey, await r.arrayBuffer(), { httpMetadata: { contentType: r.headers.get("content-type") || "image/jpeg" } }); mirrored++; }
-                  else failed++;
+                tasks.push(fetch(feUrl).then(async (r) => {
+                  if (r.ok) {
+                    await this.env.IMAGES_DB.put(feKey, await r.arrayBuffer(), { httpMetadata: { contentType: r.headers.get("content-type") || "image/jpeg" } });
+                    mirrored++;
+                  } else failed++;
                 }).catch(() => { failed++; }));
               } else skipped++;
             }
@@ -411,22 +398,19 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
       return { catalogRecords: catalogKeys.length, mirrored, skipped, failed };
     });
 
-    // Step 3: Index into D1
     const indexResult = await step.do(`index-${brandSlug}`, async () => {
       let catalogKeys = [];
       let cursor;
       do {
         const listRes = await this.env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        catalogKeys = catalogKeys.concat(listRes.objects.map((o) => o.key));
         cursor = listRes.truncated ? listRes.cursor : null;
       } while (cursor);
 
       let indexed = 0, errors = 0;
-
-      // Process in batches of 50 for D1
       for (let i = 0; i < catalogKeys.length; i += 50) {
         const batch = catalogKeys.slice(i, i + 50);
-        const records = await Promise.all(batch.map(async key => {
+        const records = await Promise.all(batch.map(async (key) => {
           try {
             const obj = await this.env.MASTER_DB.get(key);
             if (!obj) return null;
@@ -442,29 +426,24 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         `);
 
-        const d1batch = records
-          .filter(r => r && r.id)
-          .map(r => stmt.bind(
-            String(r.id),
-            "fragrances",
-            r.brand || "",
-            r.brandSlug || "",
-            r.name || "",
-            r.slug || "",
-            r.fragella?.gender || null,
-            r.fragella?.year || null,
-            r.fragella?.country || null,
-            r.fragella?.longevity || null,
-            r.fragella?.sillage || null,
-            r.fragella?.popularity || null,
-            r.fragella?.rating || null,
-            r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
-            r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
-            r.fragplace ? 1 : 0,
-            r.fragella ? 1 : 0,
-            (r.fragella?.imageUrl || r.fragplace?.imageUrl) ? 1 : 0,
-            r.syncedAt || new Date().toISOString(),
-          ));
+        const d1batch = records.filter((r) => r && r.id).map((r) => stmt.bind(
+          String(r.id), "fragrances",
+          r.brand || "", r.brandSlug || "",
+          r.name || "", r.slug || "",
+          r.fragella?.gender || null,
+          r.fragella?.year || null,
+          r.fragella?.country || null,
+          r.fragella?.longevity || null,
+          r.fragella?.sillage || null,
+          r.fragella?.popularity || null,
+          r.fragella?.rating || null,
+          r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
+          r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
+          r.fragplace ? 1 : 0,
+          r.fragella ? 1 : 0,
+          r.fragella?.imageUrl || r.fragplace?.imageUrl ? 1 : 0,
+          r.syncedAt || new Date().toISOString()
+        ));
 
         if (d1batch.length > 0) {
           try {
@@ -473,7 +452,6 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
           } catch { errors += d1batch.length; }
         }
       }
-
       return { catalogRecords: catalogKeys.length, indexed, errors };
     });
 
@@ -482,15 +460,13 @@ export class CatalogWorkflow extends WorkflowEntrypoint {
       merge: mergeResult,
       images: imageResult,
       index: indexResult,
-      completedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString()
     };
   }
 }
 
-// Cron: run reindex in a time-bounded loop — processes brands until 12 min deadline
 async function cronReindex(env) {
   const DEADLINE = Date.now() + 12 * 60 * 1000;
-
   let allBrands = [];
   try {
     const indexObj = await env.MASTER_DB.get("brands/index.json");
@@ -509,17 +485,15 @@ async function cronReindex(env) {
   } catch {}
 
   let brandsProcessed = 0;
-
   while (state.currentOffset < allBrands.length && Date.now() < DEADLINE) {
     const brand = allBrands[state.currentOffset];
     const brandSlug = slugify(brand.name);
-
     let catalogKeys = [];
     try {
       let cursor;
       do {
         const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-        catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+        catalogKeys = catalogKeys.concat(listRes.objects.map((o) => o.key));
         cursor = listRes.truncated ? listRes.cursor : null;
       } while (cursor);
     } catch {}
@@ -527,7 +501,7 @@ async function cronReindex(env) {
     let indexed = 0;
     for (let i = 0; i < catalogKeys.length; i += 50) {
       const batch = catalogKeys.slice(i, i + 50);
-      const records = await Promise.all(batch.map(async key => {
+      const records = await Promise.all(batch.map(async (key) => {
         try {
           const obj = await env.MASTER_DB.get(key);
           return obj ? JSON.parse(await obj.text()) : null;
@@ -542,31 +516,36 @@ async function cronReindex(env) {
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
 
-      const d1batch = records.filter(r => r && r.id).map(r => stmt.bind(
+      const d1batch = records.filter((r) => r && r.id).map((r) => stmt.bind(
         String(r.id), "fragrances",
         r.brand || "", r.brandSlug || "",
         r.name || "", r.slug || "",
-        r.fragella?.gender || null, r.fragella?.year || null,
-        r.fragella?.country || null, r.fragella?.longevity || null,
-        r.fragella?.sillage || null, r.fragella?.popularity || null,
+        r.fragella?.gender || null,
+        r.fragella?.year || null,
+        r.fragella?.country || null,
+        r.fragella?.longevity || null,
+        r.fragella?.sillage || null,
+        r.fragella?.popularity || null,
         r.fragella?.rating || null,
         r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
         r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
-        r.fragplace ? 1 : 0, r.fragella ? 1 : 0,
-        (r.fragella?.imageUrl || r.fragplace?.imageUrl) ? 1 : 0,
-        r.syncedAt || new Date().toISOString(),
+        r.fragplace ? 1 : 0,
+        r.fragella ? 1 : 0,
+        r.fragella?.imageUrl || r.fragplace?.imageUrl ? 1 : 0,
+        r.syncedAt || new Date().toISOString()
       ));
 
       if (d1batch.length > 0) {
-        try { await env.CATALOG_DB.batch(d1batch); indexed += d1batch.length; } catch {}
+        try {
+          await env.CATALOG_DB.batch(d1batch);
+          indexed += d1batch.length;
+        } catch {}
       }
     }
 
     state.currentOffset++;
     state.totalIndexed += indexed;
     brandsProcessed++;
-
-    // Save state every 10 brands
     if (brandsProcessed % 10 === 0) {
       try {
         await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
@@ -577,21 +556,12 @@ async function cronReindex(env) {
   const done = state.currentOffset >= allBrands.length;
   state.status = done ? "done" : "running";
   if (done) state.finishedAt = new Date().toISOString();
-
   try {
     await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
   } catch {}
-
   console.log(`Reindex cron: ${brandsProcessed} brands, ${state.totalIndexed} total indexed, offset ${state.currentOffset}/${allBrands.length}, done: ${done}`);
 }
 
-
-// ---------------------------------------------------------------------------
-// /api/reindex — direct R2 → D1 indexing, bypasses Workflow
-// Reads catalog records brand by brand, writes to D1.
-// One brand per call — loop until done: true.
-// POST body: { reset?: boolean }
-// ---------------------------------------------------------------------------
 async function handleReindex(request, env, ctx) {
   if (!env.MASTER_DB) return json({ error: "MASTER_DB not configured" }, 500);
   if (!env.CATALOG_DB) return json({ error: "CATALOG_DB not configured" }, 500);
@@ -627,24 +597,21 @@ async function handleReindex(request, env, ctx) {
 
   const brand = allBrands[offset];
   const brandSlug = slugify(brand.name);
-
-  // List catalog records for this brand
   let catalogKeys = [];
   try {
     let cursor;
     do {
       const listRes = await env.MASTER_DB.list({ prefix: `catalog/${brandSlug}/`, limit: 1000, cursor });
-      catalogKeys = catalogKeys.concat(listRes.objects.map(o => o.key));
+      catalogKeys = catalogKeys.concat(listRes.objects.map((o) => o.key));
       cursor = listRes.truncated ? listRes.cursor : null;
     } while (cursor);
   } catch {}
 
   let indexed = 0;
-
   if (catalogKeys.length > 0) {
     for (let i = 0; i < catalogKeys.length; i += 50) {
       const batch = catalogKeys.slice(i, i + 50);
-      const records = await Promise.all(batch.map(async key => {
+      const records = await Promise.all(batch.map(async (key) => {
         try {
           const obj = await env.MASTER_DB.get(key);
           return obj ? JSON.parse(await obj.text()) : null;
@@ -659,26 +626,25 @@ async function handleReindex(request, env, ctx) {
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
 
-      const d1batch = records
-        .filter(r => r && r.id)
-        .map(r => stmt.bind(
-          String(r.id), "fragrances",
-          r.brand || "", r.brandSlug || "",
-          r.name || "", r.slug || "",
-          r.fragella?.gender || null,
-          r.fragella?.year || null,
-          r.fragella?.country || null,
-          r.fragella?.longevity || null,
-          r.fragella?.sillage || null,
-          r.fragella?.popularity || null,
-          r.fragella?.rating || null,
-          r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
-          r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
-          r.fragplace ? 1 : 0,
-          r.fragella ? 1 : 0,
-          (r.fragella?.imageUrl || r.fragplace?.imageUrl) ? 1 : 0,
-          r.syncedAt || new Date().toISOString(),
-        ));
+      const d1batch = records.filter((r) => r && r.id).map((r) => stmt.bind(
+        String(r.id), "fragrances",
+        r.brand || "", r.brandSlug || "",
+        r.name || "", r.slug || "",
+        r.fragella?.gender || null,
+        r.fragella?.year || null,
+        r.fragella?.country || null,
+        r.fragella?.longevity || null,
+        r.fragella?.sillage || null,
+        r.fragella?.popularity || null,
+        r.fragella?.rating || null,
+        r.fragella?.mainAccords?.length ? JSON.stringify(r.fragella.mainAccords) : null,
+        r.fragella?.imageUrl || r.fragplace?.imageUrl || null,
+        r.fragella?.imageUrl || r.fragplace?.imageUrl ? 1 : 0,
+        r.fragplace ? 1 : 0,
+        r.fragella ? 1 : 0,
+        r.fragella?.imageUrl || r.fragplace?.imageUrl ? 1 : 0,
+        r.syncedAt || new Date().toISOString()
+      ));
 
       if (d1batch.length > 0) {
         try {
@@ -694,7 +660,6 @@ async function handleReindex(request, env, ctx) {
   const done = state.currentOffset >= allBrands.length;
   state.status = done ? "done" : "running";
   if (done) state.finishedAt = new Date().toISOString();
-
   await env.MASTER_DB.put("state/reindex.json", JSON.stringify(state), { httpMetadata: { contentType: "application/json" } });
 
   return json({
@@ -705,33 +670,23 @@ async function handleReindex(request, env, ctx) {
     totalBrands: allBrands.length,
     totalIndexed: state.totalIndexed,
     thisBrand: { catalogRecords: catalogKeys.length, indexed },
-    finishedAt: done ? state.finishedAt : null,
+    finishedAt: done ? state.finishedAt : null
   });
 }
 
-
-// ---------------------------------------------------------------------------
-// /api/gemini/test — test Gemini description generation for one scent
-// POST body: { scentId?: string, brandSlug?: string }
-// Defaults to Dior Sauvage if not specified
-// ---------------------------------------------------------------------------
 async function handleGeminiTest(request, env) {
   if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY not configured" }, 500);
   if (!env.CATALOG_DB) return json({ error: "CATALOG_DB not configured" }, 500);
 
   let body = {};
   try { body = await request.json(); } catch {}
-
   const brandSlug = body.brandSlug || "dior";
   const scentId = body.scentId || null;
 
-  // Fetch a scent from D1
   let scent;
   try {
     if (scentId) {
-      scent = await env.CATALOG_DB.prepare(
-        "SELECT * FROM products WHERE id = ?"
-      ).bind(scentId).first();
+      scent = await env.CATALOG_DB.prepare("SELECT * FROM products WHERE id = ?").bind(scentId).first();
     } else {
       scent = await env.CATALOG_DB.prepare(
         "SELECT * FROM products WHERE brand_slug = ? AND has_fragella = 1 ORDER BY popularity DESC LIMIT 1"
@@ -740,12 +695,9 @@ async function handleGeminiTest(request, env) {
   } catch (err) {
     return json({ error: `D1 query failed: ${err.message}` }, 500);
   }
-
   if (!scent) return json({ error: `No scent found for brand "${brandSlug}"` }, 404);
 
   const accords = scent.main_accords ? JSON.parse(scent.main_accords) : [];
-
-  // Build prompt
   const prompt = `You are a luxury fragrance copywriter. Generate multilingual product descriptions for this fragrance.
 
 FRAGRANCE DATA:
@@ -777,9 +729,7 @@ Return ONLY valid JSON in this exact structure, no markdown, no preamble:
   "occasions": ["tag1", "tag2", "tag3"]
 }`;
 
-  // Call Gemini
   const geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + env.GEMINI_API_KEY;
-
   let geminiResponse;
   try {
     const res = await fetch(geminiUrl, {
@@ -787,22 +737,15 @@ Return ONLY valid JSON in this exact structure, no markdown, no preamble:
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192,
-          responseMimeType: "application/json",
-        }
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8192, responseMimeType: "application/json" }
       })
     });
-
     if (!res.ok) {
       const err = await res.text();
       return json({ error: `Gemini API error ${res.status}`, detail: err.slice(0, 500) }, 500);
     }
-
     const data = await res.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
     try {
       geminiResponse = JSON.parse(text);
     } catch {
@@ -813,24 +756,13 @@ Return ONLY valid JSON in this exact structure, no markdown, no preamble:
   }
 
   return json({
-    scentId: scent.id,
-    scentName: scent.name,
-    brand: scent.brand,
-    accords,
-    longevity: scent.longevity,
-    sillage: scent.sillage,
-    gender: scent.gender,
+    scentId: scent.id, scentName: scent.name, brand: scent.brand,
+    accords, longevity: scent.longevity, sillage: scent.sillage, gender: scent.gender,
     languagesGenerated: Object.keys(geminiResponse.descriptions || {}).length,
-    result: geminiResponse,
+    result: geminiResponse
   });
 }
 
-
-// ---------------------------------------------------------------------------
-// /api/export/{platform} — export catalog as marketplace-ready feed
-// Platforms: emag, trendyol, shopify, csv
-// Params: brands (comma-separated slugs), limit, offset, gender, markup, stock
-// ---------------------------------------------------------------------------
 async function handleExport(url, env) {
   const platform = url.pathname.split("/")[3];
   if (!["emag", "trendyol", "shopify", "csv"].includes(platform)) {
@@ -838,14 +770,13 @@ async function handleExport(url, env) {
   }
 
   const brandsParam = url.searchParams.get("brands") || "";
-  const brandSlugs = brandsParam ? brandsParam.split(",").map(b => slugify(b.trim())).filter(Boolean) : [];
+  const brandSlugs = brandsParam ? brandsParam.split(",").map((b) => slugify(b.trim())).filter(Boolean) : [];
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 2000);
   const offset = parseInt(url.searchParams.get("offset") || "0");
   const gender = url.searchParams.get("gender") || "";
 
   const conditions = ["category = 'fragrances'", "has_image = 1"];
   const params = [];
-
   if (brandSlugs.length > 0) {
     conditions.push(`brand_slug IN (${brandSlugs.map(() => "?").join(",")})`);
     params.push(...brandSlugs);
@@ -858,18 +789,109 @@ async function handleExport(url, env) {
   let products;
   try {
     const result = await env.CATALOG_DB.prepare(sql).bind(...params).all();
-    products = result.results.map(r => ({ ...r, main_accords: r.main_accords ? JSON.parse(r.main_accords) : [] }));
+    products = result.results.map((r) => ({ ...r, main_accords: r.main_accords ? JSON.parse(r.main_accords) : [] }));
   } catch (err) {
     return json({ error: `D1 query failed: ${err.message}` }, 500);
   }
 
-  if (platform === "emag")     return formatEMag(products, url);
+  if (platform === "emag") return formatEMag(products, url);
   if (platform === "trendyol") return formatTrendyol(products, url);
-  if (platform === "shopify")  return formatShopify(products, url);
+  if (platform === "shopify") return formatShopify(products, url);
   return formatCSV(products, url);
 }
 
-// Helper: escape CSV field
+async function handleShopifySync(request, env, ctx) {
+  if (!env.SHOPIFY_STORE) return json({ error: "SHOPIFY_STORE secret not set" }, 500);
+  if (!env.SHOPIFY_TOKEN) return json({ error: "SHOPIFY_TOKEN secret not set" }, 500);
+  if (!env.CATALOG_DB) return json({ error: "CATALOG_DB not configured" }, 500);
+
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const brandSlug  = body.brandSlug || "";
+  const limit      = Math.min(body.limit || 20, 50);
+  const offset     = body.offset || 0;
+  const status     = body.status || "draft";
+  const vendor     = body.vendor || "";
+  const markup     = body.markup || 1.4;
+
+  const conditions = ["category = 'fragrances'", "has_image = 1"];
+  const params = [];
+  if (brandSlug) { conditions.push("brand_slug = ?"); params.push(brandSlug); }
+
+  const sql = `SELECT * FROM products WHERE ${conditions.join(" AND ")} ORDER BY popularity DESC, rating DESC LIMIT ? OFFSET ?`;
+  params.push(limit, offset);
+
+  let products;
+  try {
+    const result = await env.CATALOG_DB.prepare(sql).bind(...params).all();
+    products = result.results.map((r) => ({ ...r, main_accords: r.main_accords ? JSON.parse(r.main_accords) : [] }));
+  } catch (err) {
+    return json({ error: `D1 query failed: ${err.message}` }, 500);
+  }
+
+  if (products.length === 0) return json({ done: true, message: "No products found", offset, limit });
+
+  const shopifyBase = `https://${env.SHOPIFY_STORE}/admin/api/2024-01`;
+  const shopifyHeaders = { "Content-Type": "application/json", "X-Shopify-Access-Token": env.SHOPIFY_TOKEN };
+  const results = { created: 0, skipped: 0, failed: 0, errors: [] };
+
+  for (const p of products) {
+    let existingId = null;
+    try {
+      const checkRes = await fetch(`${shopifyBase}/products.json?handle=${p.slug}&fields=id,handle&limit=1`, { headers: shopifyHeaders });
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        if (checkData.products?.length > 0) existingId = checkData.products[0].id;
+      }
+    } catch {}
+
+    if (existingId) { results.skipped++; continue; }
+
+    const base = p.popularity === "Very high" ? 89.99 : p.popularity === "High" ? 69.99 : p.popularity === "Moderate" ? 49.99 : 34.99;
+    const price        = (base * markup).toFixed(2);
+    const comparePrice = (base * markup * 1.2).toFixed(2);
+    const tags = [p.gender, p.country, ...p.main_accords.slice(0, 5), p.longevity, p.sillage, "fragrance", "perfume", p.brand].filter(Boolean).join(", ");
+    const bodyHtml = [`<p>${p.name} by ${p.brand}.</p>`, p.main_accords.length ? `<p>Main accords: ${p.main_accords.slice(0, 5).join(", ")}.</p>` : "", p.longevity ? `<p>Longevity: ${p.longevity}.</p>` : "", p.sillage ? `<p>Sillage: ${p.sillage}.</p>` : "", p.year ? `<p>Year: ${p.year}.</p>` : "", p.country ? `<p>Country: ${p.country}.</p>` : ""].filter(Boolean).join("\n");
+
+    const product = {
+      title: `${p.brand} ${p.name}`, body_html: bodyHtml, vendor: vendor || p.brand,
+      product_type: "Parfum", handle: p.slug, status, tags,
+      variants: [{ price, compare_at_price: comparePrice, sku: p.slug, barcode: p.ean || "", inventory_management: "shopify", inventory_quantity: 10, requires_shipping: true, taxable: true, weight: 500, weight_unit: "g", option1: "100ml" }],
+      options: [{ name: "Volume", values: ["100ml"] }],
+      images: p.image_url ? [{ src: p.image_url, alt: `${p.brand} ${p.name}` }] : [],
+      metafields: [
+        { namespace: "catalog", key: "fragrance_id", value: String(p.id), type: "single_line_text_field" },
+        { namespace: "catalog", key: "gender", value: p.gender || "", type: "single_line_text_field" },
+        { namespace: "catalog", key: "accords", value: p.main_accords.join("|"), type: "single_line_text_field" },
+      ].filter(m => m.value),
+    };
+
+    try {
+      const createRes = await fetch(`${shopifyBase}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
+      if (createRes.status === 429) {
+        await new Promise(r => setTimeout(r, 2000));
+        const retryRes = await fetch(`${shopifyBase}/products.json`, { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ product }) });
+        if (retryRes.ok) { results.created++; } else { results.failed++; results.errors.push({ id: p.id, slug: p.slug, status: retryRes.status }); }
+      } else if (createRes.ok) {
+        results.created++;
+      } else {
+        results.failed++;
+        const errText = await createRes.text().catch(() => "");
+        results.errors.push({ id: p.id, slug: p.slug, status: createRes.status, detail: errText.slice(0, 200) });
+      }
+    } catch (err) {
+      results.failed++;
+      results.errors.push({ id: p.id, slug: p.slug, error: err.message });
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+
+  const nextOffset = offset + products.length;
+  const done = products.length < limit;
+  return json({ done, offset, limit, processed: products.length, nextOffset: done ? null : nextOffset, results, callNext: done ? null : `POST /api/shopify/sync with { offset: ${nextOffset}${brandSlug ? `, brandSlug: "${brandSlug}"` : ""} }` });
+}
+
 function csvField(v) {
   if (v === null || v === undefined) return "";
   const s = String(v);
@@ -877,238 +899,84 @@ function csvField(v) {
   return s;
 }
 
-// Helper: estimate price from popularity (placeholder until real prices from suppliers)
 function estimatePrice(p, markup = 1.4) {
-  const base = p.popularity === "Very high" ? 89.99 :
-               p.popularity === "High" ? 69.99 :
-               p.popularity === "Moderate" ? 49.99 : 34.99;
+  const base = p.popularity === "Very high" ? 89.99 : p.popularity === "High" ? 69.99 : p.popularity === "Moderate" ? 49.99 : 34.99;
   return (base * markup).toFixed(2);
 }
 
-// ---------------------------------------------------------------------------
-// eMag formatter — CSV feed compatible with eMag Marketplace
-// Matches existing eMag catalog products by EAN (no human validation needed)
-// ---------------------------------------------------------------------------
 function formatEMag(products, url) {
   const markup = parseFloat(url.searchParams.get("markup") || "1.4");
   const stock = url.searchParams.get("stock") || "10";
   const market = url.searchParams.get("market") || "ro";
-
   const marketConfig = {
-    ro: { currency: "RON", vatRate: 21, apiBase: "marketplace.emag.ro",
-          gender: { men: "Parfum masculin", women: "Parfum feminin", unisex: "Parfum unisex" } },
-    bg: { currency: "BGN", vatRate: 20, apiBase: "marketplace.emag.bg",
-          gender: { men: "Мъжки парфюм", women: "Дамски парфюм", unisex: "Унисекс парфюм" } },
-    hu: { currency: "HUF", vatRate: 27, apiBase: "marketplace.emag.hu",
-          gender: { men: "Férfi parfüm", women: "Női parfüm", unisex: "Uniszex parfüm" } },
+    ro: { currency: "RON", vatRate: 21, apiBase: "marketplace.emag.ro", gender: { men: "Parfum masculin", women: "Parfum feminin", unisex: "Parfum unisex" } },
+    bg: { currency: "BGN", vatRate: 20, apiBase: "marketplace.emag.bg", gender: { men: "Мъжки парфюм", women: "Дамски парфюм", unisex: "Унисекс парфюм" } },
+    hu: { currency: "HUF", vatRate: 27, apiBase: "marketplace.emag.hu", gender: { men: "Férfi parfüm", women: "Női parfüm", unisex: "Uniszex parfüm" } }
   };
   const cfg = marketConfig[market] || marketConfig.ro;
-
-  const headers = [
-    "seller_id", "ean", "name", "brand", "part_number", "description",
-    "image_url", "gender", "longevity", "sillage", "main_accords",
-    "year", "country", "sale_price", "min_sale_price", "max_sale_price",
-    "currency", "vat_rate", "stock", "market", "api_base",
-    "has_fragplace", "has_fragella"
-  ];
-
-  const rows = products.map(p => {
+  const headers = ["seller_id","ean","name","brand","part_number","description","image_url","gender","longevity","sillage","main_accords","year","country","sale_price","min_sale_price","max_sale_price","currency","vat_rate","stock","market","api_base","has_fragplace","has_fragella"];
+  const rows = products.map((p) => {
     const price = estimatePrice(p, markup);
     const minPrice = (parseFloat(price) * 0.85).toFixed(2);
     const maxPrice = (parseFloat(price) * 1.15).toFixed(2);
     const genderKey = p.gender === "men" ? "men" : p.gender === "women" ? "women" : "unisex";
-    const desc = `${p.name} ${cfg.gender[genderKey]}. ${p.main_accords.slice(0,3).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}`;
-    return [
-      p.id, p.ean || "", `${p.brand} ${p.name}`, p.brand, p.slug,
-      desc, p.image_url || "",
-      p.gender || "", p.longevity || "", p.sillage || "",
-      p.main_accords.join("|"), p.year || "", p.country || "",
-      price, minPrice, maxPrice,
-      cfg.currency, cfg.vatRate, stock, market, cfg.apiBase,
-      p.has_fragplace, p.has_fragella
-    ].map(csvField).join(",");
+    const desc = `${p.name} ${cfg.gender[genderKey]}. ${p.main_accords.slice(0, 3).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}`;
+    return [p.id, p.ean || "", `${p.brand} ${p.name}`, p.brand, p.slug, desc, p.image_url || "", p.gender || "", p.longevity || "", p.sillage || "", p.main_accords.join("|"), p.year || "", p.country || "", price, minPrice, maxPrice, cfg.currency, cfg.vatRate, stock, market, cfg.apiBase, p.has_fragplace, p.has_fragella].map(csvField).join(",");
   });
-
   const csv = [headers.join(","), ...rows].join("\n");
-  return new Response(csv, {
-    headers: {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="emag-${market}-export-${Date.now()}.csv"`,
-      "Access-Control-Allow-Origin": "*",
-    }
-  });
+  return new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="emag-${market}-export-${Date.now()}.csv"`, "Access-Control-Allow-Origin": "*" } });
 }
 
-
-// ---------------------------------------------------------------------------
-// Trendyol formatter — JSON feed for Trendyol product API
-// Uses barcode (EAN) as primary identifier
-// POST to: POST /integration/product/sellers/{sellerId}/products
-// ---------------------------------------------------------------------------
 function formatTrendyol(products, url) {
   const markup = parseFloat(url.searchParams.get("markup") || "1.4");
   const stock = parseInt(url.searchParams.get("stock") || "10");
   const market = url.searchParams.get("market") || "ro";
-
   const marketConfig = {
-    ro: { currency: "RON", vatRate: 21,
-          categories: { men: "Parfum Bărbați", women: "Parfum Femei", unisex: "Parfum Unisex" },
-          attrs: { gender: "Gen", year: "An", country: "Țara de origine", longevity: "Longevitate", sillage: "Sillage" } },
-    tr: { currency: "TRY", vatRate: 20,
-          categories: { men: "Erkek Parfüm", women: "Kadın Parfüm", unisex: "Unisex Parfüm" },
-          attrs: { gender: "Cinsiyet", year: "Yıl", country: "Menşei", longevity: "Kalıcılık", sillage: "Sillage" } },
-    de: { currency: "EUR", vatRate: 19,
-          categories: { men: "Herrenparfüm", women: "Damenparfüm", unisex: "Unisex Parfüm" },
-          attrs: { gender: "Geschlecht", year: "Jahr", country: "Herkunftsland", longevity: "Haltbarkeit", sillage: "Sillage" } },
-    nl: { currency: "EUR", vatRate: 21,
-          categories: { men: "Herengeur", women: "Damegeur", unisex: "Unisex Geur" },
-          attrs: { gender: "Geslacht", year: "Jaar", country: "Land van herkomst", longevity: "Houdbaarheid", sillage: "Sillage" } },
+    ro: { currency: "RON", vatRate: 21, categories: { men: "Parfum Bărbați", women: "Parfum Femei", unisex: "Parfum Unisex" }, attrs: { gender: "Gen", year: "An", country: "Țara de origine", longevity: "Longevitate", sillage: "Sillage" } },
+    tr: { currency: "TRY", vatRate: 20, categories: { men: "Erkek Parfüm", women: "Kadın Parfüm", unisex: "Unisex Parfüm" }, attrs: { gender: "Cinsiyet", year: "Yıl", country: "Menşei", longevity: "Kalıcılık", sillage: "Sillage" } },
+    de: { currency: "EUR", vatRate: 19, categories: { men: "Herrenparfüm", women: "Damenparfüm", unisex: "Unisex Parfüm" }, attrs: { gender: "Geschlecht", year: "Jahr", country: "Herkunftsland", longevity: "Haltbarkeit", sillage: "Sillage" } },
+    nl: { currency: "EUR", vatRate: 21, categories: { men: "Herengeur", women: "Damegeur", unisex: "Unisex Geur" }, attrs: { gender: "Geslacht", year: "Jaar", country: "Land van herkomst", longevity: "Houdbaarheid", sillage: "Sillage" } }
   };
   const cfg = marketConfig[market] || marketConfig.ro;
-
-  const items = products.map(p => {
+  const items = products.map((p) => {
     const price = parseFloat(estimatePrice(p, markup));
     const genderKey = p.gender === "men" ? "men" : p.gender === "women" ? "women" : "unisex";
-    const desc = `${p.name} by ${p.brand}. Main accords: ${p.main_accords.slice(0,5).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}${p.sillage ? ` Sillage: ${p.sillage}.` : ""}`;
+    const desc = `${p.name} by ${p.brand}. Main accords: ${p.main_accords.slice(0, 5).join(", ")}.${p.longevity ? ` Longevity: ${p.longevity}.` : ""}${p.sillage ? ` Sillage: ${p.sillage}.` : ""}`;
     return {
-      barcode: p.ean || String(p.id),
-      title: `${p.brand} ${p.name}`,
-      productMainId: String(p.id),
-      brandName: p.brand,
-      categoryName: cfg.categories[genderKey],
-      quantity: stock,
-      stockCode: p.slug,
-      dimensionalWeight: 0.5,
-      description: desc,
-      currencyType: cfg.currency,
-      listPrice: parseFloat((price * 1.1).toFixed(2)),
-      salePrice: price,
-      vatRate: cfg.vatRate,
+      barcode: p.ean || String(p.id), title: `${p.brand} ${p.name}`, productMainId: String(p.id),
+      brandName: p.brand, categoryName: cfg.categories[genderKey], quantity: stock,
+      stockCode: p.slug, dimensionalWeight: 0.5, description: desc,
+      currencyType: cfg.currency, listPrice: parseFloat((price * 1.1).toFixed(2)), salePrice: price, vatRate: cfg.vatRate,
       images: p.image_url ? [{ url: p.image_url }] : [],
-      attributes: [
-        p.gender    ? { attributeName: cfg.attrs.gender,    attributeValue: p.gender } : null,
-        p.year      ? { attributeName: cfg.attrs.year,      attributeValue: String(p.year) } : null,
-        p.country   ? { attributeName: cfg.attrs.country,   attributeValue: p.country } : null,
-        p.longevity ? { attributeName: cfg.attrs.longevity, attributeValue: p.longevity } : null,
-        p.sillage   ? { attributeName: cfg.attrs.sillage,   attributeValue: p.sillage } : null,
-      ].filter(Boolean),
+      attributes: [p.gender ? { attributeName: cfg.attrs.gender, attributeValue: p.gender } : null, p.year ? { attributeName: cfg.attrs.year, attributeValue: String(p.year) } : null, p.country ? { attributeName: cfg.attrs.country, attributeValue: p.country } : null, p.longevity ? { attributeName: cfg.attrs.longevity, attributeValue: p.longevity } : null, p.sillage ? { attributeName: cfg.attrs.sillage, attributeValue: p.sillage } : null].filter(Boolean),
       _meta: { market, has_ean: !!p.ean, has_fragella: !!p.has_fragella, rating: p.rating }
     };
   });
-
-  return new Response(JSON.stringify({ market, items, total: items.length, exportedAt: new Date().toISOString() }, null, 2), {
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Disposition": `attachment; filename="trendyol-${market}-export-${Date.now()}.json"`,
-      "Access-Control-Allow-Origin": "*",
-    }
-  });
+  return new Response(JSON.stringify({ market, items, total: items.length, exportedAt: new Date().toISOString() }, null, 2), { headers: { "Content-Type": "application/json", "Content-Disposition": `attachment; filename="trendyol-${market}-export-${Date.now()}.json"`, "Access-Control-Allow-Origin": "*" } });
 }
 
-
-// ---------------------------------------------------------------------------
-// Shopify formatter — CSV compatible with Shopify product import
-// https://help.shopify.com/en/manual/products/import-export/using-csv
-// ---------------------------------------------------------------------------
 function formatShopify(products, url) {
   const markup = parseFloat(url.searchParams.get("markup") || "1.4");
   const vendor = url.searchParams.get("vendor") || "";
   const published = url.searchParams.get("published") || "TRUE";
-
-  const headers = [
-    "Handle", "Title", "Body (HTML)", "Vendor", "Product Category",
-    "Type", "Tags", "Published",
-    "Option1 Name", "Option1 Value",
-    "Variant SKU", "Variant Grams", "Variant Inventory Tracker",
-    "Variant Inventory Qty", "Variant Inventory Policy",
-    "Variant Fulfillment Service", "Variant Price", "Variant Compare At Price",
-    "Variant Requires Shipping", "Variant Taxable", "Variant Barcode",
-    "Image Src", "Image Position", "Image Alt Text",
-    "Gift Card", "SEO Title", "SEO Description",
-    "Google Shopping / Gender", "Status"
-  ];
-
-  const rows = products.map(p => {
+  const headers = ["Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published","Option1 Name","Option1 Value","Variant SKU","Variant Grams","Variant Inventory Tracker","Variant Inventory Qty","Variant Inventory Policy","Variant Fulfillment Service","Variant Price","Variant Compare At Price","Variant Requires Shipping","Variant Taxable","Variant Barcode","Image Src","Image Position","Image Alt Text","Gift Card","SEO Title","SEO Description","Google Shopping / Gender","Status"];
+  const rows = products.map((p) => {
     const price = estimatePrice(p, markup);
     const comparePrice = (parseFloat(price) * 1.2).toFixed(2);
-    const tags = [
-      p.gender, p.country,
-      ...p.main_accords.slice(0, 5),
-      p.longevity, p.sillage,
-      "fragrance", "perfume", p.brand
-    ].filter(Boolean).join(", ");
-
-    const description = `<p>${p.name} by ${p.brand}.</p>
-<p>Main accords: ${p.main_accords.slice(0,5).join(", ")}.</p>
-${p.longevity ? `<p>Longevity: ${p.longevity}.</p>` : ""}
-${p.sillage ? `<p>Sillage: ${p.sillage}.</p>` : ""}
-${p.year ? `<p>Year: ${p.year}.</p>` : ""}`;
-
-    return [
-      p.slug,
-      `${p.brand} ${p.name}`,
-      description,
-      vendor || p.brand,
-      "Health & Beauty > Personal Care > Cosmetics > Perfume & Cologne",
-      "Parfum",
-      tags,
-      published,
-      "Volume", "100ml",
-      p.slug,
-      "500",
-      "shopify",
-      "10", "deny", "manual",
-      price, comparePrice,
-      "TRUE", "TRUE",
-      p.ean || "",
-      p.image_url || "",
-      "1",
-      `${p.brand} ${p.name}`,
-      "FALSE",
-      `${p.brand} ${p.name} - Perfume`,
-      `${p.name} by ${p.brand}. ${p.main_accords.slice(0,3).join(", ")}.`,
-      p.gender === "men" ? "Male" : p.gender === "women" ? "Female" : "Unisex",
-      "active"
-    ].map(csvField).join(",");
+    const tags = [p.gender, p.country, ...p.main_accords.slice(0, 5), p.longevity, p.sillage, "fragrance", "perfume", p.brand].filter(Boolean).join(", ");
+    const description = `<p>${p.name} by ${p.brand}.</p>\n<p>Main accords: ${p.main_accords.slice(0, 5).join(", ")}.</p>\n${p.longevity ? `<p>Longevity: ${p.longevity}.</p>` : ""}\n${p.sillage ? `<p>Sillage: ${p.sillage}.</p>` : ""}\n${p.year ? `<p>Year: ${p.year}.</p>` : ""}`;
+    return [p.slug, `${p.brand} ${p.name}`, description, vendor || p.brand, "Health & Beauty > Personal Care > Cosmetics > Perfume & Cologne", "Parfum", tags, published, "Volume", "100ml", p.slug, "500", "shopify", "10", "deny", "manual", price, comparePrice, "TRUE", "TRUE", p.ean || "", p.image_url || "", "1", `${p.brand} ${p.name}`, "FALSE", `${p.brand} ${p.name} - Perfume`, `${p.name} by ${p.brand}. ${p.main_accords.slice(0, 3).join(", ")}.`, p.gender === "men" ? "Male" : p.gender === "women" ? "Female" : "Unisex", "active"].map(csvField).join(",");
   });
-
   const csv = [headers.join(","), ...rows].join("\n");
-  return new Response(csv, {
-    headers: {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="shopify-export-${Date.now()}.csv"`,
-      "Access-Control-Allow-Origin": "*",
-    }
-  });
+  return new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="shopify-export-${Date.now()}.csv"`, "Access-Control-Allow-Origin": "*" } });
 }
 
-// ---------------------------------------------------------------------------
-// Generic CSV formatter — master export with all fields
-// ---------------------------------------------------------------------------
 function formatCSV(products, url) {
-  const headers = [
-    "id", "brand", "brand_slug", "name", "slug", "gender", "year", "country",
-    "longevity", "sillage", "popularity", "rating", "main_accords",
-    "image_url", "ean", "has_fragplace", "has_fragella", "has_image", "synced_at"
-  ];
-
-  const rows = products.map(p => [
-    p.id, p.brand, p.brand_slug, p.name, p.slug, p.gender || "", p.year || "",
-    p.country || "", p.longevity || "", p.sillage || "", p.popularity || "",
-    p.rating || "", p.main_accords.join("|"), p.image_url || "", p.ean || "",
-    p.has_fragplace, p.has_fragella, p.has_image, p.synced_at
-  ].map(csvField).join(","));
-
+  const headers = ["id","brand","brand_slug","name","slug","gender","year","country","longevity","sillage","popularity","rating","main_accords","image_url","ean","has_fragplace","has_fragella","has_image","synced_at"];
+  const rows = products.map((p) => [p.id, p.brand, p.brand_slug, p.name, p.slug, p.gender || "", p.year || "", p.country || "", p.longevity || "", p.sillage || "", p.popularity || "", p.rating || "", p.main_accords.join("|"), p.image_url || "", p.ean || "", p.has_fragplace, p.has_fragella, p.has_image, p.synced_at].map(csvField).join(","));
   const csv = [headers.join(","), ...rows].join("\n");
-  return new Response(csv, {
-    headers: {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="catalog-export-${Date.now()}.csv"`,
-      "Access-Control-Allow-Origin": "*",
-    }
-  });
+  return new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="catalog-export-${Date.now()}.csv"`, "Access-Control-Allow-Origin": "*" } });
 }
-
 
 function normalize(str) {
   return (str || "").toLowerCase().replace(/[`\u2018\u2019''']/g, "").replace(/&/g, "and").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -1121,6 +989,3 @@ function slugify(s) {
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), { status, headers: corsHeaders });
 }
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
